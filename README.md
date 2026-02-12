@@ -111,7 +111,7 @@ This means:
 |------------|----------------------|------------------------|
 | **ReLU** | Poor (piecewise linear) | Fails (linear extrapolation) |
 | **tanh** | Moderate | Fails (saturates to constant) |
-| **Snake** | Good (learnable frequency) | Moderate |
+| **Snake** | Good (learnable frequency) | Moderate (linear backbone) |
 | **SIREN** | **Good** (native Fourier) | **Good** (maintains periodicity) |
 | **VQC** | Good | **Best** (maintains periodicity) |
 
@@ -421,6 +421,32 @@ See `docs/VQC_vs_SIREN_Comparison.md` for detailed theoretical and architectural
 
 ---
 
+### Classical Baselines (ReLU, Tanh, Snake)
+
+Three additional classical baselines provide a complete activation-function spectrum:
+
+| Baseline | Activation | Periodic Structure | Files |
+|----------|-----------|-------------------|-------|
+| **ReLU** | max(0, x) | None (piecewise linear) | `ReLU_LSTM.py`, `ReLU_TCN_EEG.py` |
+| **Tanh** | tanh(x) | None (monotonic, saturating) | `Tanh_LSTM.py`, `Tanh_TCN_EEG.py` |
+| **Snake** | x + sin²(ax)/a | Partial (linear + periodic) | `Snake_LSTM.py`, `Snake_TCN_EEG.py` |
+
+All baselines mirror the FourierQ* architecture exactly — same FFT preprocessing, same frequency-domain cell state (LSTM), same weighted aggregation (TCN). Only the gate/block computation differs.
+
+```bash
+# Run classical baselines for NARMA
+python models/ReLU_LSTM.py --n-qubits=6 --vqc-depth=2
+python models/Tanh_LSTM.py --n-qubits=6 --vqc-depth=2
+python models/Snake_LSTM.py --n-qubits=6 --vqc-depth=2 --a-init=1.0
+
+# Run classical baselines for EEG
+python models/ReLU_TCN_EEG.py --mlp-dim=8 --n-mlp-layers=2 --num-epochs=50
+python models/Tanh_TCN_EEG.py --mlp-dim=8 --n-mlp-layers=2 --num-epochs=50
+python models/Snake_TCN_EEG.py --mlp-dim=8 --n-mlp-layers=2 --a-init=1.0 --num-epochs=50
+```
+
+---
+
 ## Experiments
 
 ### PhysioNet EEG Classification
@@ -466,10 +492,12 @@ python models/FourierQTCN_EEG.py \
 
 | Model | Periodic Advantage | Expected AUC |
 |-------|-------------------|--------------|
-| Classical TCN | None | Baseline |
+| ReLU-TCN | None (piecewise linear) | Baseline |
+| Tanh-TCN | None (saturating) | ~Baseline |
 | Original QTCN | Not utilized | ~Baseline |
+| Snake-TCN | Partial (linear + periodic) | >Baseline |
 | SIREN-TCN | Classical Fourier | >Baseline |
-| FourierQTCN | **Quantum Fourier** | >Baseline |
+| FourierQTCN | **Quantum Fourier** | **Best** |
 
 #### Metrics
 - **Primary**: ROC-AUC
@@ -524,10 +552,12 @@ model = FourierQLSTM(
 
 | Model | Periodic Advantage | Expected MSE |
 |-------|-------------------|--------------|
-| Classical LSTM | None | Baseline |
+| ReLU-LSTM | None (piecewise linear) | Baseline |
+| Tanh-LSTM | None (saturating) | ~Baseline |
 | Original QLSTM | Destroyed | ~Baseline or worse |
+| Snake-LSTM | Partial (linear + periodic) | <Baseline |
 | SIREN-LSTM | Classical Fourier | <Baseline |
-| FourierQLSTM | **Quantum Fourier** | <Baseline |
+| FourierQLSTM | **Quantum Fourier** | **Best** |
 
 #### Metrics
 - **Primary**: MSE (Mean Squared Error)
@@ -593,6 +623,16 @@ python models/FourierQLSTM.py
 
 # NARMA with SIREN-LSTM (classical Fourier baseline)
 python models/SIREN_LSTM.py --n-qubits=6 --vqc-depth=2
+
+# NARMA with classical baselines
+python models/ReLU_LSTM.py --n-qubits=6 --vqc-depth=2
+python models/Tanh_LSTM.py --n-qubits=6 --vqc-depth=2
+python models/Snake_LSTM.py --n-qubits=6 --vqc-depth=2
+
+# EEG with classical baselines
+python models/ReLU_TCN_EEG.py --mlp-dim=8 --n-mlp-layers=2 --num-epochs=50
+python models/Tanh_TCN_EEG.py --mlp-dim=8 --n-mlp-layers=2 --num-epochs=50
+python models/Snake_TCN_EEG.py --mlp-dim=8 --n-mlp-layers=2 --num-epochs=50
 ```
 
 ---
@@ -613,6 +653,12 @@ VQC-PeriodicData/
 │   ├── FourierQTCN_EEG.py                     # Fourier-QTCN (periodic-aware)
 │   ├── SIREN_LSTM.py                          # SIREN-LSTM (classical Fourier baseline)
 │   ├── SIREN_TCN_EEG.py                       # SIREN-TCN (classical Fourier baseline)
+│   ├── ReLU_LSTM.py                           # ReLU-LSTM (no periodic structure)
+│   ├── ReLU_TCN_EEG.py                        # ReLU-TCN (no periodic structure)
+│   ├── Tanh_LSTM.py                           # Tanh-LSTM (no periodic structure)
+│   ├── Tanh_TCN_EEG.py                        # Tanh-TCN (no periodic structure)
+│   ├── Snake_LSTM.py                          # Snake-LSTM (partial periodic)
+│   ├── Snake_TCN_EEG.py                       # Snake-TCN (partial periodic)
 │   ├── PeriodicAwareQTCN_EEG.py               # Alternative periodic QTCN
 │   ├── QLSTM_v0.py                            # Original QLSTM (for comparison)
 │   ├── HQTCN2_EEG.py                          # Original QTCN (for comparison)
@@ -630,6 +676,7 @@ VQC-PeriodicData/
     ├── VQC_Universal_Extrapolation_Analysis.md
     ├── VQC_vs_Snake_Practical_Comparison.md
     ├── VQC_vs_SIREN_Comparison.md             # VQC vs SIREN (classical Fourier)
+    ├── VQC_vs_Snake_Practical_Comparison.md   # VQC vs Snake (partial periodic)
     └── Hybrid_VQC_Snake_Architecture_Analysis.md
 ```
 

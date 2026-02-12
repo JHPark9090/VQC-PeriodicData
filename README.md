@@ -46,6 +46,7 @@ This project investigates this question and provides:
 | Original QTCN ignores frequency structure | Periodic advantage not utilized |
 | Original QLSTM destroys periodicity | sigmoid/tanh after VQC eliminates periodic structure |
 | FFT + frequency-matched encoding | Enables full periodic advantage |
+| SIREN also computes Fourier series | Strongest classical challenger — isolates quantum vs classical Fourier |
 
 ---
 
@@ -111,6 +112,7 @@ This means:
 | **ReLU** | Poor (piecewise linear) | Fails (linear extrapolation) |
 | **tanh** | Moderate | Fails (saturates to constant) |
 | **Snake** | Good (learnable frequency) | Moderate |
+| **SIREN** | **Good** (native Fourier) | **Good** (maintains periodicity) |
 | **VQC** | Good | **Best** (maintains periodicity) |
 
 #### What's NOT Proven
@@ -361,6 +363,64 @@ outputs, (c_mag, c_phase) = model(x_sequence)
 
 ---
 
+### SIREN Baselines (Classical Fourier Challenger)
+
+SIREN (Sitzmann et al., NeurIPS 2020) uses `sin(w0 * (Wx + b))` as activation, making it a **direct classical analogue** of VQC's Fourier series. Both methods fundamentally compute Fourier series with trainable coefficients. Adding SIREN as a baseline isolates: **does quantum Fourier give advantage over classical Fourier?**
+
+#### SIREN-LSTM
+
+**File**: `models/SIREN_LSTM.py`
+
+Mirrors FourierQLSTM exactly — same FFT preprocessing, same frequency-domain memory, same rescaled gating — with 4 SIRENGate instances replacing 4 FrequencyMatchedVQC instances.
+
+```python
+from models.SIREN_LSTM import SIREN_LSTM
+
+model = SIREN_LSTM(
+    input_size=1,
+    hidden_size=4,
+    n_qubits=6,       # SIREN input dim (matched to VQC)
+    vqc_depth=2,       # SIREN depth (matched to VQC)
+    window_size=8,
+    w0=30.0,           # SIREN frequency (learnable)
+    learnable_w0=True
+)
+```
+
+#### SIREN-TCN
+
+**File**: `models/SIREN_TCN_EEG.py`
+
+Mirrors FourierQTCN exactly — same sliding window, same FFT extraction, same weighted aggregation — with SIRENBlock replacing quantum circuit.
+
+```python
+from models.SIREN_TCN_EEG import SIREN_TCN
+
+model = SIREN_TCN(
+    siren_dim=8,           # Equivalent to n_qubits
+    n_siren_layers=2,      # Equivalent to circuit_depth
+    input_dim=(batch, channels, time),
+    kernel_size=12,
+    dilation=3,
+    w0=30.0,
+    learnable_w0=True
+)
+```
+
+#### Key Comparison: VQC vs SIREN
+
+| Aspect | VQC (FourierQ*) | SIREN |
+|--------|-----------------|-------|
+| Core computation | Quantum Fourier series | Classical Fourier series |
+| Frequency control | Encoding Hamiltonian + freq_scale | Learnable w0 |
+| Batch processing | Per-sample (circuit) | Full batch (native) |
+| Parameter efficiency | High (exponential Hilbert space) | Standard (polynomial) |
+| Training speed | Slower (simulation) | Faster (GPU-native) |
+
+See `docs/VQC_vs_SIREN_Comparison.md` for detailed theoretical and architectural analysis.
+
+---
+
 ## Experiments
 
 ### PhysioNet EEG Classification
@@ -408,7 +468,8 @@ python models/FourierQTCN_EEG.py \
 |-------|-------------------|--------------|
 | Classical TCN | None | Baseline |
 | Original QTCN | Not utilized | ~Baseline |
-| FourierQTCN | **Fully utilized** | >Baseline |
+| SIREN-TCN | Classical Fourier | >Baseline |
+| FourierQTCN | **Quantum Fourier** | >Baseline |
 
 #### Metrics
 - **Primary**: ROC-AUC
@@ -465,7 +526,8 @@ model = FourierQLSTM(
 |-------|-------------------|--------------|
 | Classical LSTM | None | Baseline |
 | Original QLSTM | Destroyed | ~Baseline or worse |
-| FourierQLSTM | **Fully utilized** | <Baseline |
+| SIREN-LSTM | Classical Fourier | <Baseline |
+| FourierQLSTM | **Quantum Fourier** | <Baseline |
 
 #### Metrics
 - **Primary**: MSE (Mean Squared Error)
@@ -523,8 +585,14 @@ cd VQC-PeriodicData
 # PhysioNet EEG with FourierQTCN
 python models/FourierQTCN_EEG.py --n-qubits=8 --num-epochs=50
 
+# PhysioNet EEG with SIREN-TCN (classical Fourier baseline)
+python models/SIREN_TCN_EEG.py --siren-dim=8 --n-siren-layers=2 --num-epochs=50
+
 # NARMA with FourierQLSTM
 python models/FourierQLSTM.py
+
+# NARMA with SIREN-LSTM (classical Fourier baseline)
+python models/SIREN_LSTM.py --n-qubits=6 --vqc-depth=2
 ```
 
 ---
@@ -543,6 +611,8 @@ VQC-PeriodicData/
 ├── models/                                    # Model implementations
 │   ├── FourierQLSTM.py                        # Fourier-QLSTM (periodic-aware)
 │   ├── FourierQTCN_EEG.py                     # Fourier-QTCN (periodic-aware)
+│   ├── SIREN_LSTM.py                          # SIREN-LSTM (classical Fourier baseline)
+│   ├── SIREN_TCN_EEG.py                       # SIREN-TCN (classical Fourier baseline)
 │   ├── PeriodicAwareQTCN_EEG.py               # Alternative periodic QTCN
 │   ├── QLSTM_v0.py                            # Original QLSTM (for comparison)
 │   ├── HQTCN2_EEG.py                          # Original QTCN (for comparison)
@@ -559,6 +629,7 @@ VQC-PeriodicData/
     ├── VQC_vs_ReLU_Periodic_Data_Comparison.md
     ├── VQC_Universal_Extrapolation_Analysis.md
     ├── VQC_vs_Snake_Practical_Comparison.md
+    ├── VQC_vs_SIREN_Comparison.md             # VQC vs SIREN (classical Fourier)
     └── Hybrid_VQC_Snake_Architecture_Analysis.md
 ```
 
@@ -576,6 +647,9 @@ VQC-PeriodicData/
 
 3. **Pérez-Salinas, A., et al.** (2020). Data re-uploading for a universal quantum classifier. *Quantum*, 4, 226.
    - **Key insight**: Repeated encoding expands frequency spectrum
+
+4. **Sitzmann, V., Martel, J. N., Bergman, A. W., Lindell, D. B., & Wetzstein, G.** (2020). Implicit Neural Representations with Periodic Activation Functions. *Advances in Neural Information Processing Systems*, 33.
+   - **Key insight**: sin(w0·(Wx+b)) as universal periodic activation; classical Fourier baseline for VQC
 
 ### Additional Resources
 

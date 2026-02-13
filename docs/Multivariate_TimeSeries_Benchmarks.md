@@ -56,7 +56,7 @@ Test:   months 17-20 →  5,900 steps  (11520:17420)
 
 ### 2. Weather
 
-**Source:** [Autoformer repository](https://drive.google.com/drive/folders/1ohGYWWfm4i9LC71pE29fhz4Y_UZcQYMZ) (Wu et al., 2021)
+**Source:** [Autoformer repository](https://drive.google.com/drive/folders/1ohGYWWfm4i9LC71pE29fhz4Y_UZcQYMZ) (Wu et al., 2021; Kolle, 2025)
 
 | Property | Value |
 |----------|-------|
@@ -84,7 +84,7 @@ Test:   20%  →  10,539 steps
 
 ### 3. ECL (Electricity Consumption Load)
 
-**Source:** [Autoformer repository](https://drive.google.com/drive/folders/1ohGYWWfm4i9LC71pE29fhz4Y_UZcQYMZ) (Wu et al., 2021)
+**Source:** [Autoformer repository](https://drive.google.com/drive/folders/1ohGYWWfm4i9LC71pE29fhz4Y_UZcQYMZ) (Wu et al., 2021; Trindade, 2015)
 
 | Property | Value |
 |----------|-------|
@@ -412,3 +412,5 @@ result = get_forecasting_dataloaders(
 - Liu, Y., Hu, T., Zhang, H., et al. (2024). iTransformer: Inverted Transformers Are Effective for Time Series Forecasting. *ICLR 2024*.
 - Schuld, M., Sweke, R., & Meyer, J.J. (2021). Effect of data encoding on the expressive power of variational quantum machine learning models. *Physical Review A*, 103(3), 032430.
 - Ziyin, L., Hartwig, T., & Ueda, M. (2020). Neural networks fail to learn periodic functions and how to fix it. *NeurIPS 2020*.
+- Kolle, O. (2025). Documentation of the Weather Station on Top of the Roof of the Institute Building of the Max-Planck-Institute for Biogeochemistry.
+- Trindade, A. (2015). ElectricityLoadDiagrams20112014 [Dataset] _UCI Machine Learning Repository_. https://doi.org/https://doi.org/10.24432/C58C86

@@ -595,6 +595,9 @@ def get_args():
                         help="NARMA order (5, 10, or 30)")
     parser.add_argument("--n-samples", type=int, default=500,
                         help="Number of NARMA samples")
+    parser.add_argument("--dataset", type=str, default="narma",
+                        choices=["narma", "multisine", "mackey_glass", "adding"],
+                        help="Dataset to use (default: narma)")
     return parser.parse_args()
 
 
@@ -632,29 +635,23 @@ def main():
     print(f"NARMA order: {args.narma_order}")
     print(f"{'='*60}\n")
 
-    # Generate NARMA data
-    try:
-        x, y = get_narma_data(
-            n_0=args.narma_order,
-            seq_len=window_size,
-            n_samples=args.n_samples,
-            seed=args.seed
-        )
-        y = y.unsqueeze(1)
-    except Exception as e:
-        print(f"NARMA data generation failed ({e}), using synthetic data...")
-        t = torch.linspace(0, 10 * np.pi, 500)
-        x = torch.sin(t) + 0.5 * torch.sin(3 * t) + 0.1 * torch.randn_like(t)
-        y = torch.sin(t + 0.5).unsqueeze(1)
-
-        seq_len = window_size + 4
-        x_seqs = []
-        y_seqs = []
-        for i in range(len(x) - seq_len):
-            x_seqs.append(x[i:i + seq_len])
-            y_seqs.append(y[i + seq_len - 1])
-        x = torch.stack(x_seqs)
-        y = torch.stack(y_seqs)
+    # Generate data
+    if args.dataset == "narma":
+        x, y = get_narma_data(n_0=args.narma_order, seq_len=window_size,
+                              n_samples=args.n_samples, seed=args.seed)
+    elif args.dataset == "multisine":
+        from data.multisine_generator import get_multisine_data
+        x, y = get_multisine_data(K=5, seq_len=window_size,
+                                   n_samples=args.n_samples, seed=args.seed)
+    elif args.dataset == "mackey_glass":
+        from data.mackey_glass_generator import get_mackey_glass_data
+        x, y = get_mackey_glass_data(tau=17, seq_len=window_size,
+                                      n_samples=args.n_samples, seed=args.seed)
+    elif args.dataset == "adding":
+        from data.adding_problem_generator import get_adding_data
+        x, y = get_adding_data(T=window_size, n_samples=args.n_samples,
+                                seed=args.seed)
+    y = y.unsqueeze(1)
 
     # Train/test split
     n_train = int(0.67 * len(x))

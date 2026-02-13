@@ -39,6 +39,8 @@ try:
 except ImportError:
     print("Warning: Load_PhysioNet_EEG not found. You'll need to provide your own data loader.")
 
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
+
 
 def get_args():
     parser = argparse.ArgumentParser(description="Periodic-Aware QTCN for EEG Classification")
@@ -794,7 +796,7 @@ def run_training(
     lr: float = 0.001,
     target_bands: List[str] = ['alpha', 'beta', 'gamma'],
     sampling_rate: float = 160.0,
-    checkpoint_dir: str = "PA_QTCN_checkpoints",
+    checkpoint_dir: str = None,
     resume: bool = False,
     args=None
 ):
@@ -822,6 +824,8 @@ def run_training(
     optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 
     # Checkpoint handling
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join(RESULTS_DIR, 'PA_QTCN_checkpoints')
     os.makedirs(checkpoint_dir, exist_ok=True)
     bands_str = "_".join(target_bands)
     checkpoint_path = os.path.join(
@@ -901,8 +905,10 @@ def run_training(
             'test_auc': test_metrics[0]['test_auc']
         })
 
+    metrics_dir = os.path.join(RESULTS_DIR, 'metrics')
+    os.makedirs(metrics_dir, exist_ok=True)
     metrics_df = pd.DataFrame(metrics)
-    csv_filename = f"PA_QTCN_bands{bands_str}_qubits{n_qubits}_seed{seed}_metrics.csv"
+    csv_filename = os.path.join(metrics_dir, f"PA_QTCN_bands{bands_str}_qubits{n_qubits}_seed{seed}_metrics.csv")
     metrics_df.to_csv(csv_filename, index=False)
     print(f"Metrics saved to {csv_filename}")
 

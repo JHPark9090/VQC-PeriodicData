@@ -1,0 +1,87 @@
+
+    ╔══════════════════════════════════════════════════════════════════════════╗
+    ║              OLD QLSTM vs FOURIER-QLSTM                                  ║
+    ╠══════════════════════════════════════════════════════════════════════════╣
+    ║                                                                          ║
+    ║  OLD QLSTM (QLSTM_v0.py):                                                ║
+    ║  ├─ Input: Raw time-domain values                                        ║
+    ║  ├─ Encoding: Generic RY only                                            ║
+    ║  ├─ Gates: sigmoid(VQC) / tanh(VQC) ← DESTROYS PERIODICITY               ║
+    ║  ├─ Memory: Classical (c_t, h_t)                                         ║
+    ║  └─ VQC Periodic Advantage: NOT UTILIZED                                 ║
+    ║                                                                          ║
+    ║  FOURIER-QLSTM:                                                          ║
+    ║  ├─ Input: FFT → (magnitude, phase)                                      ║
+    ║  ├─ Encoding: RY(x) + RX(freq_scale * x)                                 ║
+    ║  ├─ Gates: rescale(VQC) = (VQC + 1) / 2 ← PRESERVES PERIODICITY          ║
+    ║  ├─ Memory: Frequency-domain (c_magnitude, c_phase)                      ║
+    ║  └─ VQC Periodic Advantage: FULLY UTILIZED                               ║
+    ║                                                                          ║
+    ║  KEY DIFFERENCES:                                                        ║
+    ║  ┌────────────────────┬────────────────────┬────────────────────────┐    ║
+    ║  │ Aspect             │ Old QLSTM          │ Fourier-QLSTM          │    ║
+    ║  ├────────────────────┼────────────────────┼────────────────────────┤    ║
+    ║  │ Input Processing   │ Raw values         │ FFT (lossless)         │    ║
+    ║  │ Frequency Matching │ None               │ Learnable freq_scale   │    ║
+    ║  │ Gate Activation    │ sigmoid/tanh       │ Rescaling (periodic)   │    ║
+    ║  │ Cell State         │ Single tensor      │ (magnitude, phase)     │    ║
+    ║  │ Phase Handling     │ None               │ Additive accumulation  │    ║
+    ║  │ Periodic Advantage │ Destroyed          │ Preserved              │    ║
+    ║  └────────────────────┴────────────────────┴────────────────────────┘    ║
+    ║                                                                          ║
+    ╚══════════════════════════════════════════════════════════════════════════╝
+    
+
+============================================================
+Fourier-QLSTM Training
+============================================================
+Input size: 1
+Hidden size: 4
+N qubits: 6
+VQC depth: 2
+Window size: 8
+Dataset: mackey_glass
+============================================================
+
+Training samples: 329
+Test samples: 163
+Input shape: torch.Size([329, 8])
+
+============================================================
+Fourier-QLSTM Cell Initialized
+============================================================
+Input size: 1
+Hidden size: 4
+Number of qubits: 6
+Window size: 8
+Number of frequencies: 5
+FFT feature dimension: 10
+============================================================
+
+
+============================================================
+Training...
+============================================================
+Epoch  10/50: Train Loss = 0.037903, Test Loss = 0.037881
+  Freq scales: [0.39, 3.44]
+Epoch  20/50: Train Loss = 0.010954, Test Loss = 0.015451
+  Freq scales: [0.36, 3.75]
+Epoch  30/50: Train Loss = 0.038654, Test Loss = 0.059906
+  Freq scales: [0.58, 3.73]
+Epoch  40/50: Train Loss = 0.014995, Test Loss = 0.011513
+  Freq scales: [0.63, 3.65]
+Epoch  50/50: Train Loss = 0.010623, Test Loss = 0.012190
+  Freq scales: [0.53, 3.67]
+
+============================================================
+Training Complete!
+Final Train Loss: 0.010623
+Final Test Loss: 0.012190
+============================================================
+
+Learned Frequency Scales:
+  Input Gate: [0.89570225 0.52708324 0.97456673 0.91393514 3.67160483 3.        ]
+  Forget Gate: [0.5 1.  1.5 2.  2.5 3. ]
+  Cell Gate: [0.69646983 0.5867289  0.69402311 1.85592666 2.34999888 3.        ]
+  Output Gate: [ 2.73034614e-03 -5.29968260e-03  1.18609489e+00  1.32759646e+00
+  2.19861774e+00  3.00000000e+00]

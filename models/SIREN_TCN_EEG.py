@@ -54,6 +54,14 @@ except ImportError:
     except ImportError:
         print("Warning: Load_PhysioNet_EEG not found. You'll need to provide your own data loader.")
 
+try:
+    from dataset_dispatcher import add_dataset_args, load_dataset
+except ImportError:
+    import sys; sys.path.insert(0, os.path.dirname(__file__))
+    from dataset_dispatcher import add_dataset_args, load_dataset
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
+
 
 def get_args():
     parser = argparse.ArgumentParser(description="SIREN-TCN for EEG Classification")
@@ -78,6 +86,7 @@ def get_args():
     parser.add_argument("--num-epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--kernel-size", type=int, default=12, help="Temporal kernel size")
     parser.add_argument("--dilation", type=int, default=3, help="Dilation factor")
+    add_dataset_args(parser)
     return parser.parse_args()
 
 
@@ -479,7 +488,8 @@ def train_epoch(
     optimizer,
     criterion,
     device,
-    clip_grad: float = 1.0
+    clip_grad: float = 1.0,
+    task: str = 'classification'
 ) -> Tuple[float, float]:
     """Train for one epoch."""
     model.train()
@@ -508,19 +518,23 @@ def train_epoch(
     all_labels = np.concatenate(all_labels)
     all_outputs = np.concatenate(all_outputs)
 
-    try:
-        train_auroc = roc_auc_score(all_labels, all_outputs)
-    except ValueError:
-        train_auroc = 0.5
+    if task == 'classification':
+        try:
+            metric = roc_auc_score(all_labels, all_outputs)
+        except ValueError:
+            metric = 0.5
+    else:
+        metric = np.sqrt(np.mean((all_labels - all_outputs) ** 2))
 
-    return train_loss / len(dataloader), train_auroc
+    return train_loss / len(dataloader), metric
 
 
 def evaluate(
     model: nn.Module,
     dataloader,
     criterion,
-    device
+    device,
+    task: str = 'classification'
 ) -> Tuple[float, float]:
     """Evaluate model on validation/test set."""
     model.eval()
@@ -543,12 +557,15 @@ def evaluate(
     all_labels = np.concatenate(all_labels)
     all_outputs = np.concatenate(all_outputs)
 
-    try:
-        auroc = roc_auc_score(all_labels, all_outputs)
-    except ValueError:
-        auroc = 0.5
+    if task == 'classification':
+        try:
+            metric = roc_auc_score(all_labels, all_outputs)
+        except ValueError:
+            metric = 0.5
+    else:
+        metric = np.sqrt(np.mean((all_labels - all_outputs) ** 2))
 
-    return running_loss / len(dataloader), auroc
+    return running_loss / len(dataloader), metric
 
 
 def run_training(
@@ -567,15 +584,12 @@ def run_training(
     siren_hidden_dim: int = 64,
     num_epochs: int = 50,
     lr: float = 0.001,
-    checkpoint_dir: str = "SIREN_TCN_checkpoints",
+    checkpoint_dir: str = None,
     resume: bool = False,
-    args=None
+    args=None,
+    task: str = 'classification'
 ):
-    """
-    Run full training pipeline for SIREN-TCN.
-
-    Mirrors FourierQTCN_EEG.run_training exactly.
-    """
+    """Run full training pipeline for SIREN-TCN."""
     print(f"\n{'='*60}")
     print("Starting SIREN-TCN Training (Classical Fourier Baseline)")
     print(f"{'='*60}")
@@ -583,7 +597,6 @@ def run_training(
     set_all_seeds(seed)
     print(f"Random Seed: {seed}")
 
-    # Create model
     model = SIREN_TCN(
         siren_dim=siren_dim,
         n_siren_layers=n_siren_layers,
@@ -596,16 +609,23 @@ def run_training(
         siren_hidden_dim=siren_hidden_dim
     ).to(device)
 
-    # Loss and optimizer
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    # Task-specific criterion and tracking
+    if task == 'classification':
+        criterion = nn.BCEWithLogitsLoss()
+        sched_mode, metric_name = 'max', 'auc'
+        best_metric, is_better = 0.0, lambda new, old: new > old
+    else:
+        criterion = nn.MSELoss()
+        sched_mode, metric_name = 'min', 'rmse'
+        best_metric, is_better = float('inf'), lambda new, old: new < old
 
-    # Learning rate scheduler
+    optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+        optimizer, mode=sched_mode, factor=0.5, patience=5, verbose=True
     )
 
-    # Checkpoint handling
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join(RESULTS_DIR, 'SIREN_TCN_checkpoints')
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(
         checkpoint_dir,
@@ -614,7 +634,6 @@ def run_training(
 
     start_epoch = 0
     train_metrics, valid_metrics = [], []
-    best_val_auc = 0.0
     best_model_state = None
 
     if resume and os.path.exists(checkpoint_path):
@@ -625,78 +644,67 @@ def run_training(
         start_epoch = checkpoint['epoch'] + 1
         train_metrics = checkpoint.get('train_metrics', [])
         valid_metrics = checkpoint.get('valid_metrics', [])
-        best_val_auc = checkpoint.get('best_val_auc', 0.0)
-        print(f"Resuming from epoch {start_epoch + 1}, best AUC: {best_val_auc:.4f}")
+        best_metric = checkpoint.get('best_val_metric', best_metric)
+        print(f"Resuming from epoch {start_epoch + 1}, best {metric_name}: {best_metric:.4f}")
 
-    # Training loop
     for epoch in range(start_epoch, num_epochs):
         start_time = time.time()
 
-        # Train
-        train_loss, train_auc = train_epoch(
-            model, train_loader, optimizer, criterion, device
+        train_loss, train_m = train_epoch(
+            model, train_loader, optimizer, criterion, device, task=task
         )
         train_metrics.append({
             'epoch': epoch + 1,
             'train_loss': train_loss,
-            'train_auc': train_auc
+            f'train_{metric_name}': train_m
         })
 
-        # Validate
-        valid_loss, valid_auc = evaluate(model, val_loader, criterion, device)
+        valid_loss, valid_m = evaluate(model, val_loader, criterion, device, task=task)
         valid_metrics.append({
             'epoch': epoch + 1,
             'valid_loss': valid_loss,
-            'valid_auc': valid_auc
+            f'valid_{metric_name}': valid_m
         })
 
-        # Update learning rate
-        scheduler.step(valid_auc)
+        scheduler.step(valid_m)
 
         end_time = time.time()
         epoch_mins, epoch_secs = epoch_time(start_time, end_time)
 
-        # Track best model
-        if valid_auc > best_val_auc:
-            best_val_auc = valid_auc
+        if is_better(valid_m, best_metric):
+            best_metric = valid_m
             best_model_state = copy.deepcopy(model.state_dict())
 
-        # Print progress
         print(f"\nEpoch: {epoch + 1:02}/{num_epochs} | Time: {epoch_mins}m {epoch_secs}s")
-        print(f"Train Loss: {train_loss:.4f}, AUC: {train_auc:.4f}")
-        print(f"Valid Loss: {valid_loss:.4f}, AUC: {valid_auc:.4f} (Best: {best_val_auc:.4f})")
+        print(f"Train Loss: {train_loss:.4f}, {metric_name.upper()}: {train_m:.4f}")
+        print(f"Valid Loss: {valid_loss:.4f}, {metric_name.upper()}: {valid_m:.4f} (Best: {best_metric:.4f})")
 
-        # Print learned w0 values periodically
         if (epoch + 1) % 10 == 0:
             w0_vals = model.get_w0_values()
             print(f"Learned w0: {[f'{v:.2f}' for v in w0_vals]}")
 
-        # Save checkpoint
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_metrics': train_metrics,
             'valid_metrics': valid_metrics,
-            'best_val_auc': best_val_auc
+            'best_val_metric': best_metric
         }, checkpoint_path)
 
-    # Load best model for final evaluation
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
-    # Final test evaluation
-    test_loss, test_auc = evaluate(model, test_loader, criterion, device)
+    test_loss, test_metric = evaluate(model, test_loader, criterion, device, task=task)
 
     print(f"\n{'='*60}")
     print("Final Results")
     print(f"{'='*60}")
     print(f"Test Loss: {test_loss:.4f}")
-    print(f"Test AUC: {test_auc:.4f}")
-    print(f"Best Validation AUC: {best_val_auc:.4f}")
+    print(f"Test {metric_name.upper()}: {test_metric:.4f}")
+    print(f"Best Validation {metric_name.upper()}: {best_metric:.4f}")
     print(f"Total parameters: {count_parameters(model)}")
 
-    # Print final learned w0
     w0_vals = model.get_w0_values()
     print(f"\nLearned w0 Values:")
     for i, val in enumerate(w0_vals):
@@ -704,34 +712,35 @@ def run_training(
 
     print(f"{'='*60}\n")
 
-    # Save metrics to CSV
     metrics = []
     for i in range(len(train_metrics)):
         metrics.append({
             'epoch': i + 1,
             'train_loss': train_metrics[i]['train_loss'],
-            'train_auc': train_metrics[i]['train_auc'],
+            f'train_{metric_name}': train_metrics[i][f'train_{metric_name}'],
             'valid_loss': valid_metrics[i]['valid_loss'],
-            'valid_auc': valid_metrics[i]['valid_auc'],
+            f'valid_{metric_name}': valid_metrics[i][f'valid_{metric_name}'],
             'test_loss': test_loss,
-            'test_auc': test_auc
+            f'test_{metric_name}': test_metric
         })
 
+    metrics_dir = os.path.join(RESULTS_DIR, 'metrics')
+    os.makedirs(metrics_dir, exist_ok=True)
+
     metrics_df = pd.DataFrame(metrics)
-    csv_filename = f"SIREN_TCN_s{siren_dim}_l{n_siren_layers}_seed{seed}_metrics.csv"
+    csv_filename = os.path.join(metrics_dir, f"SIREN_TCN_s{siren_dim}_l{n_siren_layers}_seed{seed}_metrics.csv")
     metrics_df.to_csv(csv_filename, index=False)
     print(f"Metrics saved to {csv_filename}")
 
-    # Save learned w0 values
     w0_df = pd.DataFrame({
         'layer': list(range(len(w0_vals))),
         'w0': w0_vals
     })
-    w0_filename = f"SIREN_TCN_s{siren_dim}_l{n_siren_layers}_seed{seed}_w0.csv"
+    w0_filename = os.path.join(metrics_dir, f"SIREN_TCN_s{siren_dim}_l{n_siren_layers}_seed{seed}_w0.csv")
     w0_df.to_csv(w0_filename, index=False)
     print(f"w0 values saved to {w0_filename}")
 
-    return test_loss, test_auc, model
+    return test_loss, test_metric, model
 
 
 # =============================================================================
@@ -741,30 +750,20 @@ def run_training(
 if __name__ == "__main__":
     args = get_args()
 
-    # Print comparison info
     print(f"\n{'='*60}")
-    print("SIREN-TCN: Classical Fourier Baseline for EEG")
+    print("SIREN-TCN: Classical Fourier Baseline")
     print("Mirrors FourierQTCN architecture (quantum circuit -> SIREN)")
     print(f"{'='*60}\n")
 
-    # Load data
-    print("Loading data...")
-    train_loader, val_loader, test_loader, input_dim = load_eeg_ts_revised(
-        seed=args.seed,
-        device=device,
-        batch_size=32,
-        sampling_freq=args.freq,
-        sample_size=args.n_sample
-    )
-
-    print(f"Input Dimension: {input_dim}")
-    print(f"Sampling Frequency: {args.freq} Hz")
+    # Load data via dispatcher
+    train_loader, val_loader, test_loader, input_dim, task, scaler = load_dataset(args, device)
+    print(f"Dataset: {args.dataset}, Task: {task}, Input dim: {input_dim}")
 
     # Adjust kernel_size and dilation based on sampling frequency
     if args.kernel_size is None:
-        if args.freq == 80:
+        if getattr(args, 'freq', 80) == 80:
             kernel_size, dilation = 12, 3
-        elif args.freq == 4:
+        elif getattr(args, 'freq', 80) == 4:
             kernel_size, dilation = 7, 2
         else:
             kernel_size, dilation = 10, 2
@@ -772,8 +771,7 @@ if __name__ == "__main__":
         kernel_size = args.kernel_size
         dilation = args.dilation
 
-    # Run training
-    test_loss, test_auc, model = run_training(
+    test_loss, test_metric, model = run_training(
         seed=args.seed,
         siren_dim=args.siren_dim,
         n_siren_layers=args.n_siren_layers,
@@ -790,10 +788,12 @@ if __name__ == "__main__":
         num_epochs=args.num_epochs,
         lr=args.lr,
         resume=args.resume,
-        args=args
+        args=args,
+        task=task
     )
 
+    metric_name = 'AUC' if task == 'classification' else 'RMSE'
     print(f"\n{'='*60}")
     print("Training Complete!")
-    print(f"Final Test AUC: {test_auc:.4f}")
+    print(f"Final Test {metric_name}: {test_metric:.4f}")
     print(f"{'='*60}")

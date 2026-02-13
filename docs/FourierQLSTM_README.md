@@ -39,6 +39,7 @@ Fourier-QLSTM:   FFT → VQC as "Fourier generator" → rescale → output
 |---------|-------------|
 | **FFT Preprocessing** | Lossless frequency extraction from input |
 | **Frequency-Matched Encoding** | RY + learnable freq_scale × RX |
+| **FFT-Seeded Initialization** | Data-informed freq_scale starting point via power spectrum analysis |
 | **Rescaled Gating** | (VQC + 1) / 2 instead of sigmoid |
 | **Frequency-Domain Memory** | Cell state as (magnitude, phase) |
 | **Phase Accumulation** | Additive phase updates for periodic signals |
@@ -241,7 +242,7 @@ def _extract_fft_features(self, x):
 - **Fourier alignment**: VQC outputs Fourier series, FFT extracts Fourier coefficients
 - **Natural match**: Both input and VQC speak the same "language"
 
-### 2. Frequency-Matched Encoding
+### 2. Frequency-Matched Encoding with FFT-Seeded Initialization
 
 ```python
 def _circuit_fn(self, inputs):
@@ -255,6 +256,20 @@ def _circuit_fn(self, inputs):
 - Maps input frequencies to VQC's natural frequency spectrum
 - Similar to Snake activation's learnable `a` parameter
 - Each qubit specializes in different frequency range
+
+**FFT-seeded initialization** (`--freq-init=fft`, default):
+- Analyzes training data power spectrum to find dominant frequencies
+- Converts top-N frequency bin indices to ratio-based scaling factors
+- Clamps to [0.5, 5.0] range, sorted ascending (lower qubits = lower frequencies)
+- Parameter remains learnable — FFT provides a data-informed starting point
+- Falls back to `linspace(0.5, 3.0)` with `--freq-init=linspace`
+
+```python
+# FFT-seeded: different datasets → different initializations
+# NARMA:  freq_scale = [1.0, 2.0, 3.0, 4.0, 4.5, 5.0]
+# ETTh1:  freq_scale = [1.0, 2.0, 3.0, 4.0, 5.0, 5.0]
+# vs linspace: freq_scale = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]  (always the same)
+```
 
 ### 3. Rescaled Gating (No Sigmoid!)
 
@@ -335,6 +350,7 @@ h_t = o_t * c_mag * torch.cos(c_phase * np.pi)
 | **Frequency Extraction** | None | Magnitude + Phase |
 | **Encoding Gates** | RY only | RY + freq_scale × RX |
 | **Frequency Matching** | None | Learnable per qubit |
+| **freq_scale Init** | N/A | FFT-seeded (data-informed) or linspace (generic) |
 | **Gate Activation** | sigmoid / tanh | (VQC + 1) / 2 |
 | **Periodicity After Gate** | **Destroyed** | **Preserved** |
 | **Cell State Type** | Single tensor | (magnitude, phase) |
@@ -347,12 +363,38 @@ h_t = o_t * c_mag * torch.cos(c_phase * np.pi)
 
 ## Usage
 
-### Basic Usage
+### Command-Line Usage (FFT-seeded init, default)
+
+```bash
+cd /pscratch/sd/j/junghoon/VQC-PeriodicData
+
+# NARMA with FFT-seeded freq_scale (default)
+PYTHONNOUSERSITE=1 python models/FourierQLSTM.py \
+    --dataset=narma \
+    --n-qubits=6 \
+    --vqc-depth=2 \
+    --n-epochs=50
+
+# With generic linspace init (legacy behavior)
+PYTHONNOUSERSITE=1 python models/FourierQLSTM.py \
+    --dataset=narma \
+    --freq-init=linspace \
+    --n-epochs=50
+
+# Multisine dataset with FFT-seeded init
+PYTHONNOUSERSITE=1 python models/FourierQLSTM.py \
+    --dataset=multisine \
+    --freq-init=fft \
+    --n-qubits=8 \
+    --n-epochs=100
+```
+
+### Python API — Basic Usage
 
 ```python
-from FourierQLSTM import FourierQLSTM
+from FourierQLSTM import FourierQLSTM, analyze_training_frequencies
 
-# Create model
+# Create model (generic init)
 model = FourierQLSTM(
     input_size=1,       # Univariate time-series
     hidden_size=4,      # Frequency-domain hidden dimension
@@ -368,6 +410,26 @@ outputs, (c_mag, c_phase) = model(x)
 
 # outputs: [batch, n_windows, output_size]
 # Use outputs[:, -1, :] for final prediction
+```
+
+### With FFT-Seeded Initialization
+
+```python
+from FourierQLSTM import FourierQLSTM, analyze_training_frequencies
+
+# Analyze training data to seed freq_scale
+freq_scale_init = analyze_training_frequencies(x_train, n_qubits=6)
+# Prints: FFT-seeded freq_scale: [1.0, 2.0, 3.0, 4.0, 4.5, 5.0]
+
+# Create model with data-informed initialization
+model = FourierQLSTM(
+    input_size=1,
+    hidden_size=4,
+    n_qubits=6,
+    vqc_depth=2,
+    window_size=8,
+    freq_scale_init=freq_scale_init  # FFT-seeded
+).double()
 ```
 
 ### With Custom Configuration
@@ -394,13 +456,17 @@ from torch.optim import Adam
 x_train = torch.randn(100, 20)  # [batch, seq_len]
 y_train = torch.randn(100, 1)   # [batch, output_size]
 
+# FFT-seeded initialization
+freq_scale_init = analyze_training_frequencies(x_train, n_qubits=6)
+
 # Model
 model = FourierQLSTM(
     input_size=1,
     hidden_size=4,
     n_qubits=6,
     vqc_depth=2,
-    window_size=8
+    window_size=8,
+    freq_scale_init=freq_scale_init
 ).double()
 
 # Training
@@ -445,6 +511,7 @@ for gate_name in ['input_gate', 'forget_gate', 'cell_gate', 'output_gate']:
 | `output_size` | 1 | Output dimension | Task-dependent |
 | `window_size` | 8 | FFT window size | 8, 16, 32 |
 | `n_frequencies` | window_size//2+1 | FFT frequencies | ≤ window_size//2+1 |
+| `freq_init` | `fft` | freq_scale initialization method | `fft` (data-informed) or `linspace` (generic) |
 
 ### Training Parameters
 
@@ -558,7 +625,7 @@ def forward(self, x, hidden):
 
 ## File Location
 
-**Implementation**: `/pscratch/sd/j/junghoon/VQC-PeriodicData/FourierQLSTM.py`
+**Implementation**: `/pscratch/sd/j/junghoon/VQC-PeriodicData/models/FourierQLSTM.py`
 
 **Related Documentation**:
 - `QLSTM_Periodic_Advantage_Analysis.md` - Analysis of original QLSTM's limitations
@@ -589,6 +656,7 @@ Fourier-QLSTM addresses all the issues with the original QLSTM:
 | Sigmoid destroys periodicity | `sigmoid(VQC)` | `(VQC + 1) / 2` |
 | No frequency extraction | Raw values | FFT preprocessing |
 | Generic encoding | RY only | RY + freq_scale × RX |
+| Blind parameter init | N/A | FFT-seeded freq_scale from data power spectrum |
 | Classical memory | Single tensor | (magnitude, phase) |
 | Phase information lost | tanh(c_t) | cos(c_phase × π) |
 

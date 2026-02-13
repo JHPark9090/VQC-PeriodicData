@@ -210,6 +210,9 @@ def get_args():
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--narma-order", type=int, default=10)
     p.add_argument("--n-samples", type=int, default=500)
+    p.add_argument("--dataset", type=str, default="narma",
+                   choices=["narma", "multisine", "mackey_glass", "adding"],
+                   help="Dataset to use (default: narma)")
     return p.parse_args()
 
 def main():
@@ -223,20 +226,22 @@ def main():
     print(f"Window: {args.window_size}, NARMA order: {args.narma_order}")
     print(f"{'='*60}\n")
 
-    try:
+    if args.dataset == "narma":
         x, y = get_narma_data(n_0=args.narma_order, seq_len=args.window_size,
                               n_samples=args.n_samples, seed=args.seed)
-        y = y.unsqueeze(1)
-    except Exception as e:
-        print(f"NARMA failed ({e}), using synthetic data...")
-        t = torch.linspace(0, 10*np.pi, 500)
-        x = torch.sin(t) + 0.5*torch.sin(3*t) + 0.1*torch.randn_like(t)
-        y = torch.sin(t+0.5).unsqueeze(1)
-        seq_len = args.window_size + 4
-        x_s, y_s = [], []
-        for i in range(len(x)-seq_len):
-            x_s.append(x[i:i+seq_len]); y_s.append(y[i+seq_len-1])
-        x, y = torch.stack(x_s), torch.stack(y_s)
+    elif args.dataset == "multisine":
+        from data.multisine_generator import get_multisine_data
+        x, y = get_multisine_data(K=5, seq_len=args.window_size,
+                                   n_samples=args.n_samples, seed=args.seed)
+    elif args.dataset == "mackey_glass":
+        from data.mackey_glass_generator import get_mackey_glass_data
+        x, y = get_mackey_glass_data(tau=17, seq_len=args.window_size,
+                                      n_samples=args.n_samples, seed=args.seed)
+    elif args.dataset == "adding":
+        from data.adding_problem_generator import get_adding_data
+        x, y = get_adding_data(T=args.window_size, n_samples=args.n_samples,
+                                seed=args.seed)
+    y = y.unsqueeze(1)
 
     n_train = int(0.67 * len(x))
     x_train, x_test = x[:n_train], x[n_train:]

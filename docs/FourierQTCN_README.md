@@ -35,6 +35,7 @@ Fourier-Based QTCN addresses all these issues with minimal classical computation
 |-------|---------------|----------------------|
 | No frequency analysis | Raw time-domain input | FFT-based frequency extraction |
 | Generic encoding | Standard RY gates | RY + frequency-scaled RX encoding |
+| Blind freq_scale init | N/A | FFT-seeded initialization (data-informed) |
 | Mean aggregation | `torch.mean()` | Learnable weighted aggregation |
 | FC bottleneck | Multi-layer FC | Single linear projection |
 
@@ -150,19 +151,43 @@ def _extract_fft_features(self, window):
 - **Phase**: Captures the temporal alignment of oscillations
 - Together they provide complete frequency-domain information
 
-### 2. Learnable Frequency Rescaling
+### 2. Learnable Frequency Rescaling with FFT-Seeded Initialization
 
-```python
-# Initialize with spread across frequency range
-self.freq_scale = nn.Parameter(
-    torch.linspace(0.5, 3.0, n_qubits)
-)
-```
-
-This parameter is **essential** for VQC's periodic advantage:
+The `freq_scale` parameter is **essential** for VQC's periodic advantage:
 - Maps input frequency content to VQC's natural frequency spectrum
 - Learned during training to optimize for the specific dataset
 - Analogous to Snake activation's learnable `a` parameter
+
+**Initialization methods** (controlled by `--freq-init`):
+
+| Method | Flag | Description |
+|--------|------|-------------|
+| **FFT-seeded** (default) | `--freq-init=fft` | Analyzes training data via FFT to find dominant frequencies, uses ratio-based scaling to seed `freq_scale` |
+| **Linspace** (legacy) | `--freq-init=linspace` | Generic `linspace(0.5, 3.0)` initialization (original behavior) |
+
+**FFT-seeded initialization** (hybrid of Methods 3 + 4 from the encoding guide):
+
+```python
+# Analyzes training data power spectrum, finds top-N frequency bins,
+# converts to ratio-based scaling factors clamped to [0.5, 5.0]
+freq_scale_init = analyze_training_frequencies(train_loader, n_qubits)
+
+# Parameter remains learnable — FFT just provides a better starting point
+self.freq_scale = nn.Parameter(freq_scale_init.clone().float())
+```
+
+**Why FFT-seeded?**
+- Avoids local minima from blind initialization
+- Preserves actual frequency relationships in the data (ratio-based)
+- Different datasets produce different initializations (e.g., EEG vs ETTh1)
+- Parameter remains fully learnable via backpropagation
+
+**Linspace fallback** (backward compatible):
+
+```python
+# Original generic initialization
+self.freq_scale = nn.Parameter(torch.linspace(0.5, 3.0, n_qubits))
+```
 
 ### 3. Frequency-Matched Encoding
 
@@ -248,6 +273,7 @@ output = (outputs * weights.unsqueeze(0)).sum(dim=1)
 | **Frequency Extraction** | None (raw time-domain) | FFT-based (complete spectrum) |
 | **Information Loss** | High (FC layer compression) | None (FFT is invertible) |
 | **Frequency Matching** | None | Learnable `freq_scale` per qubit |
+| **freq_scale Init** | N/A | FFT-seeded (data-informed) or linspace (generic) |
 | **Encoding Gates** | RY only | RY + frequency-scaled RX |
 | **Temporal Aggregation** | `torch.mean()` | Learnable weighted sum |
 | **Classical Overhead** | Medium (multi-layer FC) | Low (single linear layer) |
@@ -258,12 +284,13 @@ output = (outputs * weights.unsqueeze(0)).sum(dim=1)
 
 ## Usage
 
-### Basic Usage
+### Basic Usage (FFT-seeded init, default)
 
 ```bash
-cd /pscratch/sd/j/junghoon/HQTCN_Project/scripts
+cd /pscratch/sd/j/junghoon/VQC-PeriodicData
 
-python FourierQTCN_EEG.py \
+python models/FourierQTCN_EEG.py \
+    --dataset=eeg \
     --n-qubits=8 \
     --circuit-depth=2 \
     --freq=80 \
@@ -273,22 +300,38 @@ python FourierQTCN_EEG.py \
     --seed=2025
 ```
 
+This uses `--freq-init=fft` by default, which analyzes the training data to seed `freq_scale`.
+
+### With Generic Linspace Init (legacy behavior)
+
+```bash
+python models/FourierQTCN_EEG.py \
+    --dataset=eeg \
+    --n-qubits=8 \
+    --circuit-depth=2 \
+    --freq-init=linspace \
+    --num-epochs=50
+```
+
 ### With Custom FFT Frequencies
 
 ```bash
-python FourierQTCN_EEG.py \
+python models/FourierQTCN_EEG.py \
+    --dataset=etth1 \
     --n-qubits=8 \
     --circuit-depth=2 \
     --n-frequencies=16 \
     --kernel-size=12 \
     --dilation=3 \
+    --freq-init=fft \
     --num-epochs=100
 ```
 
 ### Resume from Checkpoint
 
 ```bash
-python FourierQTCN_EEG.py \
+python models/FourierQTCN_EEG.py \
+    --dataset=eeg \
     --n-qubits=8 \
     --circuit-depth=2 \
     --resume \
@@ -309,14 +352,17 @@ python FourierQTCN_EEG.py \
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=32
 
+export PYTHONNOUSERSITE=1
 module load conda
 conda activate /pscratch/sd/j/junghoon/conda-envs/qml_eeg
 
-python FourierQTCN_EEG.py \
+python models/FourierQTCN_EEG.py \
+    --dataset=eeg \
     --n-qubits=8 \
     --circuit-depth=2 \
     --freq=80 \
     --n-sample=50 \
+    --freq-init=fft \
     --num-epochs=100 \
     --seed=2025
 ```
@@ -332,6 +378,7 @@ python FourierQTCN_EEG.py \
 | `n_qubits` | 8 | Number of qubits | 4, 6, 8, 12 |
 | `circuit_depth` | 2 | Number of conv-pool layers | 1-4 |
 | `n_frequencies` | `n_qubits` | FFT frequencies to extract | n_qubits to 2*n_qubits |
+| `freq_init` | `fft` | freq_scale initialization method | `fft` (data-informed) or `linspace` (generic) |
 
 ### Temporal Parameters
 
@@ -395,7 +442,7 @@ print(df)
 
 ## File Location
 
-**Implementation**: `/pscratch/sd/j/junghoon/HQTCN_Project/scripts/FourierQTCN_EEG.py`
+**Implementation**: `/pscratch/sd/j/junghoon/VQC-PeriodicData/models/FourierQTCN_EEG.py`
 
 **Related Documentation**:
 - `VQC_Periodic_Data_Encoding_Guide.md` - Encoding strategies for VQCs
@@ -423,7 +470,7 @@ Fourier-Based QTCN is designed with one goal: **fully utilize VQC's periodic adv
 
 The key innovations are:
 1. **FFT for lossless frequency extraction** (not bandpass filtering)
-2. **Learnable frequency rescaling** (like Snake's `a` parameter)
+2. **Learnable frequency rescaling** with **FFT-seeded initialization** (data-informed starting point, like Snake's `a` parameter)
 3. **Frequency-matched quantum encoding** (RY + scaled RX)
 4. **Learnable weighted aggregation** (not mean)
 

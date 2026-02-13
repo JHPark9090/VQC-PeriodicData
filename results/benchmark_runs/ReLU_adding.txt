@@ -1,0 +1,37 @@
+
+============================================================
+ReLU-LSTM Training (Classical Baseline — No Periodic Structure)
+============================================================
+Hidden size: 4, MLP input dim: 6
+MLP depth: 2, MLP hidden dim: 64
+Window size: 50, NARMA order: 10
+============================================================
+
+Train: 335, Test: 165, Shape: torch.Size([335, 100])
+
+============================================================
+ReLU-LSTM Cell Initialized
+============================================================
+Input size: 1
+Hidden size: 4
+MLP input dim (n_qubits equiv): 6
+Window size: 50
+Number of frequencies: 26
+FFT feature dimension: 52
+============================================================
+
+Total trainable parameters: 19851
+
+============================================================
+Training...
+============================================================
+Epoch  10/50: Train=0.179485, Test=0.149490 (2.9s)
+Epoch  20/50: Train=0.179520, Test=0.149489 (2.8s)
+Epoch  30/50: Train=0.179520, Test=0.149489 (3.0s)
+Epoch  40/50: Train=0.179510, Test=0.149489 (2.8s)
+Epoch  50/50: Train=0.179498, Test=0.149490 (3.1s)
+
+============================================================
+Training Complete! Train=0.179498, Test=0.149490
+Total parameters: 19851
+============================================================

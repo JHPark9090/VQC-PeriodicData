@@ -1,0 +1,46 @@
+
+============================================================
+Snake-LSTM Training (Partial Periodic Baseline)
+============================================================
+Hidden: 4, Input dim: 6, Depth: 2
+Window: 8, Snake a_init: 1.0
+Learnable a: True, NARMA order: 10
+============================================================
+
+Train: 329, Test: 163
+
+============================================================
+Snake-LSTM Cell Initialized
+============================================================
+Input size: 1, Hidden size: 4
+Snake input dim (n_qubits equiv): 6
+Window: 8, Frequencies: 5
+============================================================
+
+Total trainable parameters: 20111
+
+Training...
+Epoch  10/50: Train=0.016276, Test=0.017085 (0.1s)
+  Input gate 'a' range: [0.71, 1.57]
+Epoch  20/50: Train=0.011274, Test=0.006961 (0.1s)
+  Input gate 'a' range: [0.75, 1.71]
+Epoch  30/50: Train=0.009181, Test=0.023598 (0.1s)
+  Input gate 'a' range: [0.67, 2.00]
+Epoch  40/50: Train=0.002542, Test=0.004826 (0.2s)
+  Input gate 'a' range: [0.65, 2.15]
+Epoch  50/50: Train=0.102230, Test=0.158275 (0.1s)
+  Input gate 'a' range: [0.29, 1.97]
+
+============================================================
+Training Complete! Train=0.102230, Test=0.158275, Params=20111
+
+Learned Snake 'a' values:
+  Input Gate Layer 0: mean=1.231, std=0.328
+  Input Gate Layer 1: mean=0.979, std=0.307
+  Forget Gate Layer 0: mean=1.000, std=0.000
+  Forget Gate Layer 1: mean=1.000, std=0.000
+  Cell Gate Layer 0: mean=0.964, std=0.270
+  Cell Gate Layer 1: mean=0.983, std=0.220
+  Output Gate Layer 0: mean=0.973, std=0.422
+  Output Gate Layer 1: mean=0.937, std=0.333
+============================================================

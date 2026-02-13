@@ -1,3 +1,4 @@
+import scipy.constants  # Must be before pennylane (scipy 1.10.1 lazy-loading workaround)
 import pennylane as qml
 import numpy as np
 import pandas as pd
@@ -7,9 +8,26 @@ from torch.optim import Adam
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 from typing import Tuple
-from Load_PhysioNet_EEG import load_eeg_ts_revised
 import math, os, copy, time, random
 import argparse
+
+try:
+    from Load_PhysioNet_EEG import load_eeg_ts_revised
+except ImportError:
+    try:
+        import sys; sys.path.insert(0, os.path.dirname(__file__))
+        from Load_PhysioNet_EEG import load_eeg_ts_revised
+    except ImportError:
+        print("Warning: Load_PhysioNet_EEG not found.")
+
+try:
+    from dataset_dispatcher import add_dataset_args, load_dataset
+except ImportError:
+    import sys; sys.path.insert(0, os.path.dirname(__file__))
+    from dataset_dispatcher import add_dataset_args, load_dataset
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
+
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -17,16 +35,18 @@ def get_args():
     parser.add_argument("--n-sample", type=int, default=50)
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--seed", type=int, default=2025)
-    parser.add_argument("--resume", action="store_true", default=False)   # resume=True if typing --resume on terminal
+    parser.add_argument("--resume", action="store_true", default=False)
+    parser.add_argument("--num-epochs", type=int, default=50)
+    parser.add_argument("--kernel-size", type=int, default=12)
+    parser.add_argument("--dilation", type=int, default=3)
+    add_dataset_args(parser)
     return parser.parse_args()
-args=get_args()
 
 
 print('Pennylane Version :', qml.__version__)
 print('Pytorch Version :', torch.__version__)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# device = "cpu"
 print("Running on ", device)
 
 
@@ -35,11 +55,11 @@ def set_all_seeds(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)           # no-op on CPU
-    torch.backends.cudnn.deterministic = True  # reproducible convolutions
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    os.environ["PL_GLOBAL_SEED"] = str(seed) 
-    qml.numpy.random.seed(seed)                # for noise channels, etc.
+    os.environ["PL_GLOBAL_SEED"] = str(seed)
+    qml.numpy.random.seed(seed)
 
 
 class QTCN(nn.Module):
@@ -53,34 +73,24 @@ class QTCN(nn.Module):
         # Quantum device initialization
         self.dev = qml.device("default.qubit", wires=n_qubits)
         self.quantum_circuit = qml.QNode(self.circuit, self.dev)
-        
-        # The kernel size defines how many time steps we consider for the "convolution"
+
         self.input_channels = input_dim[1]
         self.time_steps = input_dim[2]
         self.kernel_size = kernel_size
         self.dilation = dilation
-        
-        # The input channels are treated as the feature size for each time step
-        # Fully connected classical linear layer
-        self.fc = nn.Linear(self.input_channels * self.kernel_size, n_qubits)  # For dimension reduction
+
+        self.fc = nn.Linear(self.input_channels * self.kernel_size, n_qubits)
 
     def circuit(self, features):
-        wires = list(range(self.n_qubits))    
-        # Variational Embedding (Angle Embedding)
+        wires = list(range(self.n_qubits))
         qml.AngleEmbedding(features, wires=wires, rotation='Y')
         for layer in range(self.circuit_depth):
-            # Convolutional Layer
             self._apply_convolution(self.conv_params[layer], wires)
-            # Pooling Layer
             self._apply_pooling(self.pool_params[layer], wires)
-            wires = wires[::2]  # Retain every second qubit after pooling
-        # Measurement
+            wires = wires[::2]
         return qml.expval(qml.PauliZ(0))
 
     def _apply_convolution(self, weights, wires):
-        """
-        Convolutional layer logic (same as original).
-        """
         n_wires = len(wires)
         for p in [0, 1]:
             for indx, w in enumerate(wires):
@@ -94,28 +104,22 @@ class QTCN(nn.Module):
                     qml.U3(*weights[indx + 1, 12:], wires=wires[indx + 1])
 
     def _apply_pooling(self, pool_weights, wires):
-        # Pooling using a variational circuit
         n_wires = len(wires)
         assert n_wires >= 2, "Need at least two wires for pooling."
-
         for indx, w in enumerate(wires):
             if indx % 2 == 1 and indx < n_wires:
                 measurement = qml.measure(w)
                 qml.cond(measurement, qml.U3)(*pool_weights[indx // 2], wires=wires[indx - 1])
-                
+
     def forward(self, x):
-        # x has shape (batch_size, time_steps, input_channels)
         batch_size, input_channels, time_steps = x.size()
-        # Initialize an empty list to store the output
         output = []
-        # Slide a window of size `kernel_size` across the time steps (with dilation)
         for i in range(self.dilation * (self.kernel_size - 1), time_steps):
             indices = [i - d*self.dilation for d in range(self.kernel_size)]
             indices.reverse()
             window = x[:, :, indices].reshape(batch_size, -1)
             reduced_window = self.fc(window)
-            # Quantum Circuit Execution
-            output.append(self.quantum_circuit(reduced_window))
+            output.append(self.quantum_circuit(reduced_window.double()).float())
         output = torch.mean(torch.stack(output, dim=1), dim=1)
         return output
 
@@ -129,75 +133,97 @@ def epoch_time(start_time: float, end_time: float) -> Tuple[float, float]:
 
 
 ################################# Performance ################################
-# Training loop
-def train_perf(model, dataloader, optimizer, criterion):
+def train_perf(model, dataloader, optimizer, criterion, task='classification'):
     model.train()
     train_loss = 0.0
     all_labels = []
     all_outputs = []
     for inputs, labels in tqdm(dataloader):
-        inputs, labels = inputs.to(device), labels.to(device)  # Ensure that data is on the same device (GPU or CPU)
-        labels = labels.float()   # Ensure labels are of type float for BCEWithLogitsLoss
+        inputs, labels = inputs.to(device), labels.to(device)
+        labels = labels.float()
         optimizer.zero_grad()
         outputs = model(inputs).to(device)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
         train_loss += loss.item()
-        
-        # Collect labels and outputs for AUROC
         all_labels.append(labels.cpu().numpy())
-        all_outputs.append(outputs.detach().cpu().numpy())       
-        
-    # Calculate train AUROC
+        all_outputs.append(outputs.detach().cpu().numpy())
+
     all_labels = np.concatenate(all_labels)
     all_outputs = np.concatenate(all_outputs)
-    train_auroc = roc_auc_score(all_labels, all_outputs)
-    
-    return train_loss / len(dataloader), train_auroc
+
+    if task == 'classification':
+        try:
+            metric = roc_auc_score(all_labels, all_outputs)
+        except ValueError:
+            metric = 0.5
+    else:
+        metric = np.sqrt(np.mean((all_labels - all_outputs) ** 2))
+
+    return train_loss / len(dataloader), metric
 
 
-# Validation/Test loop
-def evaluate_perf(model, dataloader, criterion):
+def evaluate_perf(model, dataloader, criterion, task='classification'):
     model.eval()
     running_loss = 0.0
     all_labels = []
     all_outputs = []
     with torch.no_grad():
         for inputs, labels in tqdm(dataloader):
-            inputs, labels = inputs.to(device), labels.to(device)  # Ensure that data is on the same device (GPU or CPU)
-            labels = labels.float()   # Ensure labels are of type float for BCEWithLogitsLoss
+            inputs, labels = inputs.to(device), labels.to(device)
+            labels = labels.float()
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             running_loss += loss.item()
-
-            # Collect labels and outputs for AUROC
             all_labels.append(labels.cpu().numpy())
             all_outputs.append(outputs.cpu().numpy())
 
     all_labels = np.concatenate(all_labels)
     all_outputs = np.concatenate(all_outputs)
-    auroc = roc_auc_score(all_labels, all_outputs)
-    
-    return running_loss / len(dataloader), auroc
+
+    if task == 'classification':
+        try:
+            metric = roc_auc_score(all_labels, all_outputs)
+        except ValueError:
+            metric = 0.5
+    else:
+        metric = np.sqrt(np.mean((all_labels - all_outputs) ** 2))
+
+    return running_loss / len(dataloader), metric
 
 
-def QuantumTCNN_run(seed, n_qubits, circuit_depth, input_dim, kernel_size=None, dilation=None, num_epochs=10, 
-                    checkpoint_dir="QTCN_checkpoints", resume=False):
+def QuantumTCNN_run(seed, n_qubits, circuit_depth, input_dim,
+                    train_loader, val_loader, test_loader, lr=0.001,
+                    kernel_size=None, dilation=None, num_epochs=10,
+                    checkpoint_dir=None, resume=False,
+                    task='classification', dataset_name='eeg', args=None):
     print("Running on ", device)
     set_all_seeds(seed)
     print("Random Seed = ", seed)
     model = QTCN(n_qubits, circuit_depth, input_dim, kernel_size, dilation).to(device)
-    criterion = nn.BCEWithLogitsLoss()  # Use BCEWithLogitsLoss for binary classification
-    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=1e-4, eps=1e-8)
 
-    # --- Checkpoint Loading Logic ---
-    os.makedirs(checkpoint_dir, exist_ok=True) # <--- Create checkpoint directory if it doesn't exist
-    checkpoint_path = os.path.join(checkpoint_dir, f"q_tcnn_model_freq{args.freq}_sample{args.n_sample}_lr{args.lr}_{seed}.pth")
+    # Task-specific criterion and tracking
+    if task == 'classification':
+        criterion = nn.BCEWithLogitsLoss()
+        metric_name = 'auc'
+        best_metric, is_better = 0.0, lambda new, old: new > old
+    else:
+        criterion = nn.MSELoss()
+        metric_name = 'rmse'
+        best_metric, is_better = float('inf'), lambda new, old: new < old
+
+    optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4, eps=1e-8)
+
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join(RESULTS_DIR, 'QTCN_checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f"q_tcnn_model_{dataset_name}_{seed}.pth")
     start_epoch = 0
-    train_metrics, valid_metrics = [], [] # <--- Initialize here
+    train_metrics, valid_metrics = [], []
+    best_model_state = None
 
-    if resume==True and os.path.exists(checkpoint_path):
+    if resume and os.path.exists(checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -205,77 +231,89 @@ def QuantumTCNN_run(seed, n_qubits, circuit_depth, input_dim, kernel_size=None, 
         start_epoch = checkpoint['epoch'] + 1
         train_metrics = checkpoint['train_metrics']
         valid_metrics = checkpoint['valid_metrics']
+        best_metric = checkpoint.get('best_val_metric', best_metric)
         print(f"Resuming training from epoch {start_epoch + 1}")
-    # --- End Checkpoint Logic ---
 
-    # Training process
-    for epoch in range(start_epoch, num_epochs): # <--- Start from the correct epoch
+    for epoch in range(start_epoch, num_epochs):
         start_time = time.time()
-        
-        train_loss, train_auc = train_perf(model, train_loader, optimizer, criterion)
-        train_metrics.append({'epoch': epoch + 1, 'train_loss': train_loss, 'train_auc': train_auc})
-    
-        valid_loss, valid_auc = evaluate_perf(model, val_loader, criterion)
-        valid_metrics.append({'epoch': epoch + 1, 'valid_loss': valid_loss, 'valid_auc': valid_auc})
-    
+
+        train_loss, train_m = train_perf(model, train_loader, optimizer, criterion, task=task)
+        train_metrics.append({'epoch': epoch + 1, 'train_loss': train_loss, f'train_{metric_name}': train_m})
+
+        valid_loss, valid_m = evaluate_perf(model, val_loader, criterion, task=task)
+        valid_metrics.append({'epoch': epoch + 1, 'valid_loss': valid_loss, f'valid_{metric_name}': valid_m})
+
+        if is_better(valid_m, best_metric):
+            best_metric = valid_m
+            best_model_state = copy.deepcopy(model.state_dict())
+
         end_time = time.time()
         epoch_mins, epoch_secs = epoch_time(start_time, end_time)
         print(f"Epoch: {epoch + 1:02} | Time: {epoch_mins}m {epoch_secs}s")
-        print(f"Train Loss: {train_loss:.4f}, AUC: {train_auc:.4f} | Validation Loss: {valid_loss:.4f}, AUC: {valid_auc:.4f}")
+        print(f"Train Loss: {train_loss:.4f}, {metric_name.upper()}: {train_m:.4f} | "
+              f"Valid Loss: {valid_loss:.4f}, {metric_name.upper()}: {valid_m:.4f} (Best: {best_metric:.4f})")
 
-        # --- Save Checkpoint ---
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_metrics': train_metrics,
             'valid_metrics': valid_metrics,
+            'best_val_metric': best_metric,
         }, checkpoint_path)
         print(f"Checkpoint saved for epoch {epoch + 1}")
-        # --- End Save Checkpoint ---
 
-    # Final evaluation on the test set
-    test_loss, test_auc = evaluate_perf(model, test_loader, criterion)
-    print(f"Test Loss: {test_loss:.4f}, AUC: {test_auc:.4f}")
-    
-    # Final metrics processing
-    test_metrics = [{'epoch': num_epochs, 'test_loss': test_loss, 'test_auc': test_auc}]
-    
+    # Load best model for final evaluation
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    test_loss, test_metric = evaluate_perf(model, test_loader, criterion, task=task)
+    print(f"Test Loss: {test_loss:.4f}, {metric_name.upper()}: {test_metric:.4f}")
+
     metrics = []
-    # Ensure train/valid metrics are available up to the final epoch for DataFrame creation
-    final_epoch = len(train_metrics)
-    for i in range(final_epoch):
+    for i in range(len(train_metrics)):
         metrics.append({
             'epoch': i + 1,
             'train_loss': train_metrics[i]['train_loss'],
-            'train_auc': train_metrics[i]['train_auc'],
+            f'train_{metric_name}': train_metrics[i][f'train_{metric_name}'],
             'valid_loss': valid_metrics[i]['valid_loss'],
-            'valid_auc': valid_metrics[i]['valid_auc'],
-            'test_loss': test_metrics[0]['test_loss'], # Test metrics are recorded once at the end
-            'test_auc': test_metrics[0]['test_auc'],
+            f'valid_{metric_name}': valid_metrics[i][f'valid_{metric_name}'],
+            'test_loss': test_loss,
+            f'test_{metric_name}': test_metric,
         })
 
     metrics_df = pd.DataFrame(metrics)
-    csv_filename = f"QuantumTCNN_freq{args.freq}_sample{args.n_sample}_lr{args.lr}_performance_{seed}.csv"
+    metrics_dir = os.path.join(RESULTS_DIR, 'metrics')
+    os.makedirs(metrics_dir, exist_ok=True)
+    csv_filename = os.path.join(metrics_dir, f"QuantumTCNN_{dataset_name}_lr{lr}_performance_{seed}.csv")
     metrics_df.to_csv(csv_filename, index=False)
     print(f"Metrics saved to {csv_filename}")
-    
-    return test_loss, test_auc
+
+    return test_loss, test_metric
 
 
 
 if __name__ == "__main__":
-    train_loader, val_loader, test_loader, input_dim = load_eeg_ts_revised(seed=args.seed, device=device, batch_size=32, sampling_freq=args.freq, sample_size=args.n_sample)
-    print("Input Dimension:", input_dim)
-    if args.freq==80:
-        QuantumTCNN_run(seed=args.seed, n_qubits=8, circuit_depth=2, input_dim=input_dim, kernel_size=12, dilation=3, num_epochs=50, resume=args.resume)
-    elif args.freq==4:
-        QuantumTCNN_run(seed=args.seed, n_qubits=8, circuit_depth=2, input_dim=input_dim, kernel_size=7, dilation=2, num_epochs=50, resume=args.resume)
+    args = get_args()
 
+    # Load dataset via dispatcher
+    train_loader, val_loader, test_loader, input_dim, task, scaler = load_dataset(args, device)
+    print(f"Dataset: {args.dataset}, Task: {task}, Input dim: {input_dim}")
 
+    kernel_size = args.kernel_size
+    dilation = args.dilation
 
+    # Adjust defaults for EEG frequency if using EEG dataset
+    if args.dataset == 'eeg':
+        if args.freq == 80:
+            kernel_size, dilation = 12, 3
+        elif args.freq == 4:
+            kernel_size, dilation = 7, 2
 
-
-
-    
-    
+    QuantumTCNN_run(
+        seed=args.seed, n_qubits=8, circuit_depth=2, input_dim=input_dim,
+        train_loader=train_loader, val_loader=val_loader, test_loader=test_loader,
+        lr=args.lr, kernel_size=kernel_size, dilation=dilation,
+        num_epochs=args.num_epochs, resume=args.resume,
+        task=task, dataset_name=args.dataset, args=args
+    )

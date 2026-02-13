@@ -40,6 +40,14 @@ except ImportError:
     except ImportError:
         print("Warning: Load_PhysioNet_EEG not found.")
 
+try:
+    from dataset_dispatcher import add_dataset_args, load_dataset
+except ImportError:
+    import sys; sys.path.insert(0, os.path.dirname(__file__))
+    from dataset_dispatcher import add_dataset_args, load_dataset
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
+
 
 def get_args():
     parser = argparse.ArgumentParser(description="ReLU-TCN for EEG Classification")
@@ -55,6 +63,7 @@ def get_args():
     parser.add_argument("--num-epochs", type=int, default=50)
     parser.add_argument("--kernel-size", type=int, default=12)
     parser.add_argument("--dilation", type=int, default=3)
+    add_dataset_args(parser)
     return parser.parse_args()
 
 
@@ -170,7 +179,7 @@ class ReLU_TCN(nn.Module):
 def epoch_time(s, e):
     t = e - s; return int(t/60), int(t%60)
 
-def train_epoch(model, dataloader, optimizer, criterion, device, clip_grad=1.0):
+def train_epoch(model, dataloader, optimizer, criterion, device, clip_grad=1.0, task='classification'):
     model.train(); loss_sum = 0; all_l, all_o = [], []
     for inputs, labels in tqdm(dataloader, desc="Training"):
         inputs, labels = inputs.to(device), labels.to(device).float()
@@ -180,11 +189,14 @@ def train_epoch(model, dataloader, optimizer, criterion, device, clip_grad=1.0):
         optimizer.step(); loss_sum += loss.item()
         all_l.append(labels.cpu().numpy()); all_o.append(out.detach().cpu().numpy())
     all_l, all_o = np.concatenate(all_l), np.concatenate(all_o)
-    try: auc = roc_auc_score(all_l, all_o)
-    except: auc = 0.5
-    return loss_sum / len(dataloader), auc
+    if task == 'classification':
+        try: metric = roc_auc_score(all_l, all_o)
+        except: metric = 0.5
+    else:
+        metric = np.sqrt(np.mean((all_l - all_o) ** 2))
+    return loss_sum / len(dataloader), metric
 
-def evaluate(model, dataloader, criterion, device):
+def evaluate(model, dataloader, criterion, device, task='classification'):
     model.eval(); loss_sum = 0; all_l, all_o = [], []
     with torch.no_grad():
         for inputs, labels in tqdm(dataloader, desc="Evaluating"):
@@ -192,63 +204,85 @@ def evaluate(model, dataloader, criterion, device):
             out = model(inputs); loss_sum += criterion(out, labels).item()
             all_l.append(labels.cpu().numpy()); all_o.append(out.cpu().numpy())
     all_l, all_o = np.concatenate(all_l), np.concatenate(all_o)
-    try: auc = roc_auc_score(all_l, all_o)
-    except: auc = 0.5
-    return loss_sum / len(dataloader), auc
+    if task == 'classification':
+        try: metric = roc_auc_score(all_l, all_o)
+        except: metric = 0.5
+    else:
+        metric = np.sqrt(np.mean((all_l - all_o) ** 2))
+    return loss_sum / len(dataloader), metric
 
 def run_training(seed, mlp_dim, n_mlp_layers, input_dim, train_loader, val_loader,
                  test_loader, kernel_size=12, dilation=3, n_frequencies=None,
                  mlp_hidden_dim=64, num_epochs=50, lr=0.001,
-                 checkpoint_dir="ReLU_TCN_checkpoints", resume=False, args=None):
+                 checkpoint_dir=None, resume=False, args=None,
+                 task='classification'):
     set_all_seeds(seed)
     model = ReLU_TCN(mlp_dim, n_mlp_layers, input_dim, kernel_size, dilation,
                      n_frequencies, mlp_hidden_dim).to(device)
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, verbose=True)
 
+    # Task-specific criterion and scheduler
+    if task == 'classification':
+        criterion = nn.BCEWithLogitsLoss()
+        sched_mode, metric_name = 'max', 'auc'
+        best_metric, is_better = 0.0, lambda new, old: new > old
+    else:
+        criterion = nn.MSELoss()
+        sched_mode, metric_name = 'min', 'rmse'
+        best_metric, is_better = float('inf'), lambda new, old: new < old
+
+    optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode=sched_mode, factor=0.5, patience=5, verbose=True)
+
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join(RESULTS_DIR, 'ReLU_TCN_checkpoints')
     os.makedirs(checkpoint_dir, exist_ok=True)
     cp_path = os.path.join(checkpoint_dir, f"relu_tcn_d{mlp_dim}_l{n_mlp_layers}_seed{seed}.pth")
-    start_epoch, train_m, valid_m, best_auc, best_state = 0, [], [], 0.0, None
+    start_epoch, train_m, valid_m, best_state = 0, [], [], None
 
     if resume and os.path.exists(cp_path):
         cp = torch.load(cp_path, map_location=device)
         model.load_state_dict(cp['model_state_dict']); optimizer.load_state_dict(cp['optimizer_state_dict'])
         start_epoch = cp['epoch']+1; train_m = cp.get('train_metrics',[]); valid_m = cp.get('valid_metrics',[])
-        best_auc = cp.get('best_val_auc', 0.0)
+        best_metric = cp.get('best_val_metric', best_metric)
 
     for epoch in range(start_epoch, num_epochs):
         t0 = time.time()
-        tl, ta = train_epoch(model, train_loader, optimizer, criterion, device)
-        vl, va = evaluate(model, val_loader, criterion, device)
-        scheduler.step(va)
-        train_m.append({'epoch':epoch+1,'train_loss':tl,'train_auc':ta})
-        valid_m.append({'epoch':epoch+1,'valid_loss':vl,'valid_auc':va})
-        if va > best_auc: best_auc = va; best_state = copy.deepcopy(model.state_dict())
+        tl, tm_val = train_epoch(model, train_loader, optimizer, criterion, device, task=task)
+        vl, vm_val = evaluate(model, val_loader, criterion, device, task=task)
+        scheduler.step(vm_val)
+        train_m.append({'epoch':epoch+1,'train_loss':tl,f'train_{metric_name}':tm_val})
+        valid_m.append({'epoch':epoch+1,'valid_loss':vl,f'valid_{metric_name}':vm_val})
+        if is_better(vm_val, best_metric): best_metric = vm_val; best_state = copy.deepcopy(model.state_dict())
         em, es = epoch_time(t0, time.time())
-        print(f"\nEpoch {epoch+1:02}/{num_epochs} | {em}m {es}s | Train: {tl:.4f}/{ta:.4f} | Val: {vl:.4f}/{va:.4f} (Best: {best_auc:.4f})")
+        print(f"\nEpoch {epoch+1:02}/{num_epochs} | {em}m {es}s | Train: {tl:.4f}/{tm_val:.4f} | Val: {vl:.4f}/{vm_val:.4f} (Best {metric_name}: {best_metric:.4f})")
         torch.save({'epoch':epoch,'model_state_dict':model.state_dict(),'optimizer_state_dict':optimizer.state_dict(),
-                     'train_metrics':train_m,'valid_metrics':valid_m,'best_val_auc':best_auc}, cp_path)
+                     'train_metrics':train_m,'valid_metrics':valid_m,'best_val_metric':best_metric}, cp_path)
 
     if best_state: model.load_state_dict(best_state)
-    test_loss, test_auc = evaluate(model, test_loader, criterion, device)
-    print(f"\n{'='*60}\nTest Loss: {test_loss:.4f}, Test AUC: {test_auc:.4f}\nParams: {count_parameters(model)}\n{'='*60}")
+    test_loss, test_metric = evaluate(model, test_loader, criterion, device, task=task)
+    print(f"\n{'='*60}\nTest Loss: {test_loss:.4f}, Test {metric_name.upper()}: {test_metric:.4f}\nParams: {count_parameters(model)}\n{'='*60}")
 
-    metrics = [{'epoch':i+1,'train_loss':train_m[i]['train_loss'],'train_auc':train_m[i]['train_auc'],
-                'valid_loss':valid_m[i]['valid_loss'],'valid_auc':valid_m[i]['valid_auc'],
-                'test_loss':test_loss,'test_auc':test_auc} for i in range(len(train_m))]
-    pd.DataFrame(metrics).to_csv(f"ReLU_TCN_d{mlp_dim}_l{n_mlp_layers}_seed{seed}_metrics.csv", index=False)
-    return test_loss, test_auc, model
+    metrics = [{'epoch':i+1,'train_loss':train_m[i]['train_loss'],f'train_{metric_name}':train_m[i][f'train_{metric_name}'],
+                'valid_loss':valid_m[i]['valid_loss'],f'valid_{metric_name}':valid_m[i][f'valid_{metric_name}'],
+                'test_loss':test_loss,f'test_{metric_name}':test_metric} for i in range(len(train_m))]
+    metrics_dir = os.path.join(RESULTS_DIR, 'metrics')
+    os.makedirs(metrics_dir, exist_ok=True)
+    pd.DataFrame(metrics).to_csv(os.path.join(metrics_dir, f"ReLU_TCN_d{mlp_dim}_l{n_mlp_layers}_seed{seed}_metrics.csv"), index=False)
+    return test_loss, test_metric, model
 
 
 if __name__ == "__main__":
     args = get_args()
     print(f"\n{'='*60}\nReLU-TCN: Classical Baseline (No Periodic Structure)\n{'='*60}\n")
-    train_loader, val_loader, test_loader, input_dim = load_eeg_ts_revised(
-        seed=args.seed, device=device, batch_size=32, sampling_freq=args.freq, sample_size=args.n_sample)
+
+    # Load dataset via dispatcher
+    train_loader, val_loader, test_loader, input_dim, task, scaler = load_dataset(args, device)
+    print(f"Dataset: {args.dataset}, Task: {task}, Input dim: {input_dim}")
+
     kernel_size = args.kernel_size; dilation = args.dilation
-    test_loss, test_auc, model = run_training(
+    test_loss, test_metric, model = run_training(
         args.seed, args.mlp_dim, args.n_mlp_layers, input_dim, train_loader, val_loader,
         test_loader, kernel_size, dilation, args.n_frequencies, args.mlp_hidden_dim,
-        args.num_epochs, args.lr, resume=args.resume, args=args)
-    print(f"Final Test AUC: {test_auc:.4f}")
+        args.num_epochs, args.lr, resume=args.resume, args=args, task=task)
+    metric_name = 'AUC' if task == 'classification' else 'RMSE'
+    print(f"Final Test {metric_name}: {test_metric:.4f}")

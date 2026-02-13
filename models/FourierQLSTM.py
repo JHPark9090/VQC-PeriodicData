@@ -20,6 +20,7 @@ Author: Fourier-QLSTM redesign based on QLSTM_v0.py
 Date: February 2026
 """
 
+import scipy.constants  # Must precede pennylane (scipy 1.10 lazy-loading workaround)
 import pennylane as qml
 import numpy as np
 import torch
@@ -36,7 +37,12 @@ import random
 try:
     from data.narma_generator import get_narma_data
 except ImportError:
-    print("Warning: NARMA data generator not found.")
+    try:
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from data.narma_generator import get_narma_data
+    except ImportError:
+        print("Warning: NARMA data generator not found.")
 
 
 def set_all_seeds(seed: int = 42) -> None:
@@ -49,6 +55,65 @@ def set_all_seeds(seed: int = 42) -> None:
     torch.backends.cudnn.benchmark = False
     os.environ["PL_GLOBAL_SEED"] = str(seed)
     qml.numpy.random.seed(seed)
+
+
+def analyze_training_frequencies(train_data, n_qubits, max_samples=1000):
+    """
+    Analyze training data via FFT to find dominant frequencies for freq_scale init.
+
+    Args:
+        train_data: DataLoader yielding (inputs, labels) OR
+                    Tensor [n_samples, seq_len] or [n_samples, channels, seq_len]
+        n_qubits: Number of freq_scale values needed
+        max_samples: Max samples to analyze
+
+    Returns:
+        freq_scale_init: Tensor [n_qubits] with FFT-informed initialization
+    """
+    from torch.utils.data import DataLoader
+
+    # 1. Collect data into tensor
+    if isinstance(train_data, DataLoader):
+        chunks, n = [], 0
+        for inputs, *_ in train_data:
+            chunks.append(inputs.cpu().float())
+            n += inputs.shape[0]
+            if n >= max_samples:
+                break
+        data = torch.cat(chunks)[:max_samples]
+    else:
+        data = train_data[:max_samples].cpu().float()
+
+    # 2. Ensure 3D [samples, channels, time]
+    if data.dim() == 2:
+        data = data.unsqueeze(1)
+
+    # 3. Power spectrum via rfft
+    spectrum = torch.fft.rfft(data, dim=-1)
+    power = torch.abs(spectrum) ** 2
+    avg_power = power.mean(dim=(0, 1))  # [n_freq_bins]
+    avg_power[0] = 0.0  # Zero DC component
+
+    # 4. Top-N frequency bins by power
+    n_top = min(n_qubits, len(avg_power) - 1)
+    top_indices = torch.argsort(avg_power, descending=True)[:n_top]
+    top_indices = torch.sort(top_indices).values.float()
+
+    # 5. Ratio-based scaling: normalize by fundamental frequency
+    fundamental = top_indices[0].clamp(min=1.0)
+    freq_scale = top_indices / fundamental
+    freq_scale = freq_scale.clamp(min=0.5, max=5.0)
+
+    # 6. Pad if fewer bins than n_qubits
+    if len(freq_scale) < n_qubits:
+        last_val = freq_scale[-1].item() if len(freq_scale) > 0 else 1.0
+        pad = torch.linspace(last_val, min(last_val + 1.0, 5.0),
+                             n_qubits - len(freq_scale) + 1)[1:]
+        freq_scale = torch.cat([freq_scale, pad])
+
+    freq_scale = freq_scale[:n_qubits]
+    print(f"FFT-seeded freq_scale: {freq_scale.tolist()}")
+    return freq_scale
 
 
 # =============================================================================
@@ -71,7 +136,8 @@ class FrequencyMatchedVQC(nn.Module):
         self,
         n_qubits: int,
         vqc_depth: int,
-        n_outputs: int = 1
+        n_outputs: int = 1,
+        freq_scale_init: torch.Tensor = None
     ):
         super().__init__()
 
@@ -84,9 +150,10 @@ class FrequencyMatchedVQC(nn.Module):
         # =================================================================
         # Each qubit learns its optimal frequency scale
         # Similar to Snake activation's learnable 'a' parameter
-        self.freq_scale = nn.Parameter(
-            torch.linspace(0.5, 3.0, n_qubits)
-        )
+        if freq_scale_init is not None:
+            self.freq_scale = nn.Parameter(freq_scale_init.clone().float())
+        else:
+            self.freq_scale = nn.Parameter(torch.linspace(0.5, 3.0, n_qubits))
 
         # Variational parameters for entangling layers
         self.var_params = nn.Parameter(
@@ -187,7 +254,8 @@ class FourierQLSTMCell(nn.Module):
         n_qubits: int,
         vqc_depth: int,
         n_frequencies: int = None,
-        window_size: int = 8
+        window_size: int = 8,
+        freq_scale_init: torch.Tensor = None
     ):
         """
         Args:
@@ -197,6 +265,7 @@ class FourierQLSTMCell(nn.Module):
             vqc_depth: Depth of variational circuit
             n_frequencies: Number of FFT frequencies to use
             window_size: Size of input window for FFT
+            freq_scale_init: Optional FFT-seeded initialization for freq_scale
         """
         super().__init__()
 
@@ -225,10 +294,10 @@ class FourierQLSTMCell(nn.Module):
         # VQC GATES (4 circuits, one for each LSTM gate)
         # =================================================================
         # These replace classical Linear + sigmoid/tanh
-        self.input_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size)
-        self.forget_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size)
-        self.cell_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size)
-        self.output_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size)
+        self.input_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init)
+        self.forget_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init)
+        self.cell_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init)
+        self.output_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init)
 
         # =================================================================
         # OUTPUT PROJECTION
@@ -409,7 +478,8 @@ class FourierQLSTM(nn.Module):
         vqc_depth: int,
         output_size: int = 1,
         window_size: int = 8,
-        n_frequencies: int = None
+        n_frequencies: int = None,
+        freq_scale_init: torch.Tensor = None
     ):
         super().__init__()
 
@@ -423,7 +493,8 @@ class FourierQLSTM(nn.Module):
             n_qubits=n_qubits,
             vqc_depth=vqc_depth,
             n_frequencies=n_frequencies,
-            window_size=window_size
+            window_size=window_size,
+            freq_scale_init=freq_scale_init
         )
 
         # Final output layer
@@ -569,26 +640,50 @@ def evaluate(
 # MAIN
 # =============================================================================
 
+def get_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="Fourier-QLSTM for Time-Series Prediction")
+    parser.add_argument("--seed", type=int, default=2025)
+    parser.add_argument("--n-qubits", type=int, default=6)
+    parser.add_argument("--vqc-depth", type=int, default=2)
+    parser.add_argument("--hidden-size", type=int, default=4)
+    parser.add_argument("--window-size", type=int, default=8)
+    parser.add_argument("--n-epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--narma-order", type=int, default=10)
+    parser.add_argument("--n-samples", type=int, default=500)
+    parser.add_argument("--dataset", type=str, default="narma",
+                        choices=["narma", "multisine", "mackey_glass", "adding"],
+                        help="Dataset to use (default: narma)")
+    parser.add_argument("--freq-init", type=str, default="fft",
+                        choices=["fft", "linspace"],
+                        help="freq_scale initialization: 'fft' (data-informed) or 'linspace' (generic)")
+    return parser.parse_args()
+
+
 def main():
     """Main function to demonstrate Fourier-QLSTM."""
 
     print_comparison()
 
+    args = get_args()
+
     # Configuration
-    set_all_seeds(2025)
+    set_all_seeds(args.seed)
 
     # Model parameters
-    input_size = 1      # Univariate time-series
-    hidden_size = 4     # Frequency-domain hidden size
-    n_qubits = 6        # Number of qubits
-    vqc_depth = 2       # VQC depth
-    output_size = 1     # Prediction dimension
-    window_size = 8     # FFT window size
+    input_size = 1
+    hidden_size = args.hidden_size
+    n_qubits = args.n_qubits
+    vqc_depth = args.vqc_depth
+    output_size = 1
+    window_size = args.window_size
 
     # Training parameters
-    batch_size = 10
-    n_epochs = 50
-    lr = 0.01
+    batch_size = args.batch_size
+    n_epochs = args.n_epochs
+    lr = args.lr
 
     print(f"\n{'='*60}")
     print("Fourier-QLSTM Training")
@@ -598,28 +693,30 @@ def main():
     print(f"N qubits: {n_qubits}")
     print(f"VQC depth: {vqc_depth}")
     print(f"Window size: {window_size}")
+    print(f"Dataset: {args.dataset}")
     print(f"{'='*60}\n")
 
-    # Generate NARMA data
-    try:
-        x, y = get_narma_data(n_0=10, seq_len=window_size)
-        y = y.unsqueeze(1)
-    except:
-        print("Generating synthetic periodic data...")
-        # Generate synthetic periodic data
-        t = torch.linspace(0, 10 * np.pi, 500)
-        x = torch.sin(t) + 0.5 * torch.sin(3 * t) + 0.1 * torch.randn_like(t)
-        y = torch.sin(t + 0.5).unsqueeze(1)  # Predict phase-shifted version
+    # Generate data
+    if args.dataset == "narma":
+        x, y = get_narma_data(n_0=args.narma_order, seq_len=window_size,
+                              n_samples=args.n_samples, seed=args.seed)
+    elif args.dataset == "multisine":
+        from data.multisine_generator import get_multisine_data
+        x, y = get_multisine_data(K=5, seq_len=window_size,
+                                   n_samples=args.n_samples, seed=args.seed)
+    elif args.dataset == "mackey_glass":
+        from data.mackey_glass_generator import get_mackey_glass_data
+        x, y = get_mackey_glass_data(tau=17, seq_len=window_size,
+                                      n_samples=args.n_samples, seed=args.seed)
+    elif args.dataset == "adding":
+        from data.adding_problem_generator import get_adding_data
+        x, y = get_adding_data(T=window_size, n_samples=args.n_samples,
+                                seed=args.seed)
+    y = y.unsqueeze(1)
 
-        # Create sequences
-        seq_len = window_size + 4
-        x_seqs = []
-        y_seqs = []
-        for i in range(len(x) - seq_len):
-            x_seqs.append(x[i:i + seq_len])
-            y_seqs.append(y[i + seq_len - 1])
-        x = torch.stack(x_seqs)
-        y = torch.stack(y_seqs)
+    # Convert to double for PennyLane compatibility
+    x = x.double()
+    y = y.double()
 
     # Train/test split
     n_train = int(0.67 * len(x))
@@ -630,6 +727,11 @@ def main():
     print(f"Test samples: {len(x_test)}")
     print(f"Input shape: {x_train.shape}")
 
+    # Compute FFT-seeded freq_scale initialization if requested
+    freq_scale_init = None
+    if args.freq_init == 'fft':
+        freq_scale_init = analyze_training_frequencies(x_train, n_qubits)
+
     # Create model
     model = FourierQLSTM(
         input_size=input_size,
@@ -637,7 +739,8 @@ def main():
         n_qubits=n_qubits,
         vqc_depth=vqc_depth,
         output_size=output_size,
-        window_size=window_size
+        window_size=window_size,
+        freq_scale_init=freq_scale_init
     ).double()
 
     # Optimizer

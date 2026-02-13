@@ -1,0 +1,60 @@
+
+============================================================
+SIREN-LSTM Training (Classical Fourier Baseline)
+============================================================
+Input size: 1
+Hidden size: 4
+SIREN input dim (n_qubits equiv): 6
+SIREN depth (vqc_depth equiv): 2
+Window size: 50
+w0 (initial): 30.0
+Learnable w0: True
+SIREN hidden dim: 64
+NARMA order: 10
+============================================================
+
+Training samples: 335
+Test samples: 165
+Input shape: torch.Size([335, 100])
+
+============================================================
+SIREN-LSTM Cell Initialized
+============================================================
+Input size: 1
+Hidden size: 4
+SIREN input dim (n_qubits equiv): 6
+Window size: 50
+Number of frequencies: 26
+FFT feature dimension: 52
+Initial w0: [30.0, 30.0]
+============================================================
+
+
+Total trainable parameters: 19859
+
+============================================================
+Training...
+============================================================
+Epoch  10/50: Train Loss = 0.179920, Test Loss = 0.150329 (3.5s)
+  Input gate w0: ['29.99', '29.98']
+Epoch  20/50: Train Loss = 0.178672, Test Loss = 0.149058 (4.0s)
+  Input gate w0: ['29.99', '29.98']
+Epoch  30/50: Train Loss = 0.177879, Test Loss = 0.152825 (3.5s)
+  Input gate w0: ['29.99', '29.98']
+Epoch  40/50: Train Loss = 0.178483, Test Loss = 0.149831 (4.4s)
+  Input gate w0: ['29.99', '29.98']
+Epoch  50/50: Train Loss = 0.179619, Test Loss = 0.149002 (3.4s)
+  Input gate w0: ['29.99', '29.98']
+
+============================================================
+Training Complete!
+Final Train Loss: 0.179619
+Final Test Loss: 0.149002
+Total parameters: 19859
+============================================================
+
+Learned w0 Values:
+  Input Gate: ['29.99', '29.98']
+  Forget Gate: ['29.96', '30.04']
+  Cell Gate: ['29.99', '30.00']
+  Output Gate: ['29.50', '30.39']

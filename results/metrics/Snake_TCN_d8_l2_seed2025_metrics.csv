@@ -1,0 +1,2 @@
+epoch,train_loss,train_rmse,valid_loss,valid_rmse,test_loss,test_rmse
+1,0.2203737117684959,0.4694398,0.3439322045479698,0.5864573,1.5765832573463574,1.2556207

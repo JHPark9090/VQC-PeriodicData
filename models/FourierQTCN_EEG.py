@@ -21,6 +21,7 @@ Author: Based on HQTCN2_EEG.py with Fourier-based modifications
 Date: February 2026
 """
 
+import scipy.constants  # Must be before pennylane (scipy 1.10.1 lazy-loading workaround)
 import pennylane as qml
 import numpy as np
 import pandas as pd
@@ -44,6 +45,14 @@ try:
 except ImportError:
     print("Warning: Load_PhysioNet_EEG not found. You'll need to provide your own data loader.")
 
+try:
+    from dataset_dispatcher import add_dataset_args, load_dataset
+except ImportError:
+    import sys; sys.path.insert(0, os.path.dirname(__file__))
+    from dataset_dispatcher import add_dataset_args, load_dataset
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
+
 
 def get_args():
     parser = argparse.ArgumentParser(description="Fourier-Based QTCN for EEG Classification")
@@ -58,6 +67,10 @@ def get_args():
     parser.add_argument("--num-epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--kernel-size", type=int, default=12, help="Temporal kernel size")
     parser.add_argument("--dilation", type=int, default=3, help="Dilation factor")
+    parser.add_argument("--freq-init", type=str, default="fft",
+                        choices=["fft", "linspace"],
+                        help="freq_scale initialization: 'fft' (data-informed) or 'linspace' (generic)")
+    add_dataset_args(parser)
     return parser.parse_args()
 
 
@@ -78,6 +91,65 @@ def set_all_seeds(seed: int = 42) -> None:
     torch.backends.cudnn.benchmark = False
     os.environ["PL_GLOBAL_SEED"] = str(seed)
     qml.numpy.random.seed(seed)
+
+
+def analyze_training_frequencies(train_data, n_qubits, max_samples=1000):
+    """
+    Analyze training data via FFT to find dominant frequencies for freq_scale init.
+
+    Args:
+        train_data: DataLoader yielding (inputs, labels) where inputs=[batch, channels, time]
+                    OR a Tensor [n_samples, seq_len] or [n_samples, channels, seq_len]
+        n_qubits: Number of freq_scale values needed
+        max_samples: Max samples to analyze
+
+    Returns:
+        freq_scale_init: Tensor [n_qubits] with FFT-informed initialization
+    """
+    from torch.utils.data import DataLoader
+
+    # 1. Collect data into tensor
+    if isinstance(train_data, DataLoader):
+        chunks, n = [], 0
+        for inputs, *_ in train_data:
+            chunks.append(inputs.cpu().float())
+            n += inputs.shape[0]
+            if n >= max_samples:
+                break
+        data = torch.cat(chunks)[:max_samples]
+    else:
+        data = train_data[:max_samples].cpu().float()
+
+    # 2. Ensure 3D [samples, channels, time]
+    if data.dim() == 2:
+        data = data.unsqueeze(1)
+
+    # 3. Power spectrum via rfft
+    spectrum = torch.fft.rfft(data, dim=-1)
+    power = torch.abs(spectrum) ** 2
+    avg_power = power.mean(dim=(0, 1))  # [n_freq_bins]
+    avg_power[0] = 0.0  # Zero DC component
+
+    # 4. Top-N frequency bins by power
+    n_top = min(n_qubits, len(avg_power) - 1)
+    top_indices = torch.argsort(avg_power, descending=True)[:n_top]
+    top_indices = torch.sort(top_indices).values.float()
+
+    # 5. Ratio-based scaling: normalize by fundamental frequency
+    fundamental = top_indices[0].clamp(min=1.0)
+    freq_scale = top_indices / fundamental
+    freq_scale = freq_scale.clamp(min=0.5, max=5.0)
+
+    # 6. Pad if fewer bins than n_qubits
+    if len(freq_scale) < n_qubits:
+        last_val = freq_scale[-1].item() if len(freq_scale) > 0 else 1.0
+        pad = torch.linspace(last_val, min(last_val + 1.0, 5.0),
+                             n_qubits - len(freq_scale) + 1)[1:]
+        freq_scale = torch.cat([freq_scale, pad])
+
+    freq_scale = freq_scale[:n_qubits]
+    print(f"FFT-seeded freq_scale: {freq_scale.tolist()}")
+    return freq_scale
 
 
 # =============================================================================
@@ -127,7 +199,8 @@ class FourierQTCN(nn.Module):
         kernel_size: int,
         dilation: int = 1,
         n_frequencies: int = None,
-        use_magnitude_phase: bool = True
+        use_magnitude_phase: bool = True,
+        freq_scale_init: torch.Tensor = None
     ):
         """
         Args:
@@ -138,6 +211,7 @@ class FourierQTCN(nn.Module):
             dilation: Dilation factor for temporal convolution
             n_frequencies: Number of FFT frequencies to use (default: n_qubits)
             use_magnitude_phase: If True, use magnitude and phase; else use real/imag
+            freq_scale_init: Optional FFT-seeded initialization for freq_scale
         """
         super().__init__()
 
@@ -150,8 +224,9 @@ class FourierQTCN(nn.Module):
         self.use_magnitude_phase = use_magnitude_phase
 
         # Number of FFT frequencies to extract
-        # Default to n_qubits for direct mapping
-        self.n_frequencies = n_frequencies if n_frequencies else n_qubits
+        # Default to n_qubits for direct mapping, but clamp to max FFT bins
+        max_fft_bins = kernel_size // 2 + 1  # rfft of kernel_size gives this many bins
+        self.n_frequencies = min(n_frequencies if n_frequencies else n_qubits, max_fft_bins)
 
         # =================================================================
         # COMPONENT 1: FFT Feature Dimension Calculation
@@ -177,9 +252,12 @@ class FourierQTCN(nn.Module):
         #
         # Initialize with spread to cover different frequency ranges
         # Lower indices → lower frequencies, higher indices → higher frequencies
-        self.freq_scale = nn.Parameter(
-            torch.linspace(0.5, 3.0, n_qubits)
-        )
+        if freq_scale_init is not None:
+            self.freq_scale = nn.Parameter(freq_scale_init.clone().float())
+            self._freq_init_method = 'fft'
+        else:
+            self.freq_scale = nn.Parameter(torch.linspace(0.5, 3.0, n_qubits))
+            self._freq_init_method = 'linspace'
 
         # =================================================================
         # COMPONENT 4: Quantum Circuit Parameters
@@ -237,6 +315,7 @@ class FourierQTCN(nn.Module):
         print(f"Number of FFT frequencies: {self.n_frequencies}")
         print(f"FFT feature dimension: {self.fft_feature_dim}")
         print(f"Use magnitude/phase: {self.use_magnitude_phase}")
+        print(f"freq_scale init method: {self._freq_init_method}")
         print(f"Initial freq_scale range: [{self.freq_scale.min().item():.2f}, {self.freq_scale.max().item():.2f}]")
         print(f"{'='*60}\n")
 
@@ -304,12 +383,14 @@ class FourierQTCN(nn.Module):
         # =================================================================
         for i, wire in enumerate(wires):
             # Standard amplitude encoding (RY rotation)
-            qml.RY(features[i], wires=wire)
+            # Use [..., i] indexing to correctly handle both single [n_qubits]
+            # and batched [batch, n_qubits] inputs via PennyLane broadcasting
+            qml.RY(features[..., i], wires=wire)
 
             # FREQUENCY-MATCHED encoding (RX rotation with learnable scaling)
             # This is analogous to Snake's learnable 'a' parameter
             # It maps the input to VQC's natural frequency spectrum
-            qml.RX(self.freq_scale[i] * features[i], wires=wire)
+            qml.RX(self.freq_scale[i] * features[..., i], wires=wire)
 
         # =================================================================
         # QUANTUM CONVOLUTIONAL AND POOLING LAYERS
@@ -416,7 +497,8 @@ class FourierQTCN(nn.Module):
             # =================================================================
             # STEP 3: Quantum circuit with frequency-matched encoding
             # =================================================================
-            window_output = self.quantum_circuit(projected)
+            # Cast to float64 for PennyLane backprop compatibility, then back
+            window_output = self.quantum_circuit(projected.double()).float()
             outputs.append(window_output)
 
         # =================================================================
@@ -461,7 +543,8 @@ def train_epoch(
     optimizer,
     criterion,
     device,
-    clip_grad: float = 1.0
+    clip_grad: float = 1.0,
+    task: str = 'classification'
 ) -> Tuple[float, float]:
     """Train for one epoch."""
     model.train()
@@ -478,7 +561,6 @@ def train_epoch(
         loss = criterion(outputs, labels)
         loss.backward()
 
-        # Gradient clipping for stability
         if clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
 
@@ -491,20 +573,23 @@ def train_epoch(
     all_labels = np.concatenate(all_labels)
     all_outputs = np.concatenate(all_outputs)
 
-    # Handle edge cases for AUC calculation
-    try:
-        train_auroc = roc_auc_score(all_labels, all_outputs)
-    except ValueError:
-        train_auroc = 0.5  # Default if only one class present
+    if task == 'classification':
+        try:
+            metric = roc_auc_score(all_labels, all_outputs)
+        except ValueError:
+            metric = 0.5
+    else:
+        metric = np.sqrt(np.mean((all_labels - all_outputs) ** 2))
 
-    return train_loss / len(dataloader), train_auroc
+    return train_loss / len(dataloader), metric
 
 
 def evaluate(
     model: nn.Module,
     dataloader,
     criterion,
-    device
+    device,
+    task: str = 'classification'
 ) -> Tuple[float, float]:
     """Evaluate model on validation/test set."""
     model.eval()
@@ -527,12 +612,15 @@ def evaluate(
     all_labels = np.concatenate(all_labels)
     all_outputs = np.concatenate(all_outputs)
 
-    try:
-        auroc = roc_auc_score(all_labels, all_outputs)
-    except ValueError:
-        auroc = 0.5
+    if task == 'classification':
+        try:
+            metric = roc_auc_score(all_labels, all_outputs)
+        except ValueError:
+            metric = 0.5
+    else:
+        metric = np.sqrt(np.mean((all_labels - all_outputs) ** 2))
 
-    return running_loss / len(dataloader), auroc
+    return running_loss / len(dataloader), metric
 
 
 def run_training(
@@ -548,39 +636,24 @@ def run_training(
     n_frequencies: int = None,
     num_epochs: int = 50,
     lr: float = 0.001,
-    checkpoint_dir: str = "FourierQTCN_checkpoints",
+    checkpoint_dir: str = None,
     resume: bool = False,
-    args=None
+    args=None,
+    task: str = 'classification',
+    freq_init: str = 'fft'
 ):
-    """
-    Run full training pipeline for Fourier-Based QTCN.
-
-    Args:
-        seed: Random seed
-        n_qubits: Number of qubits
-        circuit_depth: Quantum circuit depth
-        input_dim: Input dimensions
-        train_loader: Training data loader
-        val_loader: Validation data loader
-        test_loader: Test data loader
-        kernel_size: Temporal kernel size
-        dilation: Dilation factor
-        n_frequencies: Number of FFT frequencies
-        num_epochs: Training epochs
-        lr: Learning rate
-        checkpoint_dir: Directory for checkpoints
-        resume: Whether to resume from checkpoint
-        args: Additional arguments
-
-    Returns:
-        test_loss, test_auc, model
-    """
+    """Run full training pipeline for Fourier-Based QTCN."""
     print(f"\n{'='*60}")
     print("Starting Fourier-Based QTCN Training")
     print(f"{'='*60}")
 
     set_all_seeds(seed)
     print(f"Random Seed: {seed}")
+
+    # Compute FFT-seeded freq_scale initialization if requested
+    freq_scale_init = None
+    if freq_init == 'fft':
+        freq_scale_init = analyze_training_frequencies(train_loader, n_qubits)
 
     # Create model
     model = FourierQTCN(
@@ -589,19 +662,27 @@ def run_training(
         input_dim=input_dim,
         kernel_size=kernel_size,
         dilation=dilation,
-        n_frequencies=n_frequencies
+        n_frequencies=n_frequencies,
+        freq_scale_init=freq_scale_init
     ).to(device)
 
-    # Loss and optimizer
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    # Task-specific criterion and tracking
+    if task == 'classification':
+        criterion = nn.BCEWithLogitsLoss()
+        sched_mode, metric_name = 'max', 'auc'
+        best_metric, is_better = 0.0, lambda new, old: new > old
+    else:
+        criterion = nn.MSELoss()
+        sched_mode, metric_name = 'min', 'rmse'
+        best_metric, is_better = float('inf'), lambda new, old: new < old
 
-    # Learning rate scheduler
+    optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+        optimizer, mode=sched_mode, factor=0.5, patience=5, verbose=True
     )
 
-    # Checkpoint handling
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join(RESULTS_DIR, 'FourierQTCN_checkpoints')
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(
         checkpoint_dir,
@@ -610,7 +691,6 @@ def run_training(
 
     start_epoch = 0
     train_metrics, valid_metrics = [], []
-    best_val_auc = 0.0
     best_model_state = None
 
     if resume and os.path.exists(checkpoint_path):
@@ -621,77 +701,66 @@ def run_training(
         start_epoch = checkpoint['epoch'] + 1
         train_metrics = checkpoint.get('train_metrics', [])
         valid_metrics = checkpoint.get('valid_metrics', [])
-        best_val_auc = checkpoint.get('best_val_auc', 0.0)
-        print(f"Resuming from epoch {start_epoch + 1}, best AUC: {best_val_auc:.4f}")
+        best_metric = checkpoint.get('best_val_metric', best_metric)
+        print(f"Resuming from epoch {start_epoch + 1}, best {metric_name}: {best_metric:.4f}")
 
-    # Training loop
     for epoch in range(start_epoch, num_epochs):
         start_time = time.time()
 
-        # Train
-        train_loss, train_auc = train_epoch(
-            model, train_loader, optimizer, criterion, device
+        train_loss, train_m = train_epoch(
+            model, train_loader, optimizer, criterion, device, task=task
         )
         train_metrics.append({
             'epoch': epoch + 1,
             'train_loss': train_loss,
-            'train_auc': train_auc
+            f'train_{metric_name}': train_m
         })
 
-        # Validate
-        valid_loss, valid_auc = evaluate(model, val_loader, criterion, device)
+        valid_loss, valid_m = evaluate(model, val_loader, criterion, device, task=task)
         valid_metrics.append({
             'epoch': epoch + 1,
             'valid_loss': valid_loss,
-            'valid_auc': valid_auc
+            f'valid_{metric_name}': valid_m
         })
 
-        # Update learning rate
-        scheduler.step(valid_auc)
+        scheduler.step(valid_m)
 
         end_time = time.time()
         epoch_mins, epoch_secs = epoch_time(start_time, end_time)
 
-        # Track best model
-        if valid_auc > best_val_auc:
-            best_val_auc = valid_auc
+        if is_better(valid_m, best_metric):
+            best_metric = valid_m
             best_model_state = copy.deepcopy(model.state_dict())
 
-        # Print progress
         print(f"\nEpoch: {epoch + 1:02}/{num_epochs} | Time: {epoch_mins}m {epoch_secs}s")
-        print(f"Train Loss: {train_loss:.4f}, AUC: {train_auc:.4f}")
-        print(f"Valid Loss: {valid_loss:.4f}, AUC: {valid_auc:.4f} (Best: {best_val_auc:.4f})")
+        print(f"Train Loss: {train_loss:.4f}, {metric_name.upper()}: {train_m:.4f}")
+        print(f"Valid Loss: {valid_loss:.4f}, {metric_name.upper()}: {valid_m:.4f} (Best: {best_metric:.4f})")
 
-        # Print learned frequency scales periodically
         if (epoch + 1) % 10 == 0:
             freq_scales = model.get_frequency_scales()
             print(f"Learned freq_scale: [{freq_scales.min():.2f}, {freq_scales.max():.2f}]")
 
-        # Save checkpoint
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_metrics': train_metrics,
             'valid_metrics': valid_metrics,
-            'best_val_auc': best_val_auc
+            'best_val_metric': best_metric
         }, checkpoint_path)
 
-    # Load best model for final evaluation
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
-    # Final test evaluation
-    test_loss, test_auc = evaluate(model, test_loader, criterion, device)
+    test_loss, test_metric = evaluate(model, test_loader, criterion, device, task=task)
 
     print(f"\n{'='*60}")
     print("Final Results")
     print(f"{'='*60}")
     print(f"Test Loss: {test_loss:.4f}")
-    print(f"Test AUC: {test_auc:.4f}")
-    print(f"Best Validation AUC: {best_val_auc:.4f}")
+    print(f"Test {metric_name.upper()}: {test_metric:.4f}")
+    print(f"Best Validation {metric_name.upper()}: {best_metric:.4f}")
 
-    # Print final learned parameters
     freq_scales = model.get_frequency_scales()
     print(f"\nLearned Frequency Scales:")
     for i, scale in enumerate(freq_scales):
@@ -699,40 +768,35 @@ def run_training(
 
     print(f"{'='*60}\n")
 
-    # Save metrics to CSV
-    test_metrics = [{
-        'epoch': num_epochs,
-        'test_loss': test_loss,
-        'test_auc': test_auc
-    }]
-
     metrics = []
     for i in range(len(train_metrics)):
         metrics.append({
             'epoch': i + 1,
             'train_loss': train_metrics[i]['train_loss'],
-            'train_auc': train_metrics[i]['train_auc'],
+            f'train_{metric_name}': train_metrics[i][f'train_{metric_name}'],
             'valid_loss': valid_metrics[i]['valid_loss'],
-            'valid_auc': valid_metrics[i]['valid_auc'],
+            f'valid_{metric_name}': valid_metrics[i][f'valid_{metric_name}'],
             'test_loss': test_loss,
-            'test_auc': test_auc
+            f'test_{metric_name}': test_metric
         })
 
+    metrics_dir = os.path.join(RESULTS_DIR, 'metrics')
+    os.makedirs(metrics_dir, exist_ok=True)
+
     metrics_df = pd.DataFrame(metrics)
-    csv_filename = f"FourierQTCN_q{n_qubits}_d{circuit_depth}_seed{seed}_metrics.csv"
+    csv_filename = os.path.join(metrics_dir, f"FourierQTCN_q{n_qubits}_d{circuit_depth}_seed{seed}_metrics.csv")
     metrics_df.to_csv(csv_filename, index=False)
     print(f"Metrics saved to {csv_filename}")
 
-    # Save learned frequency scales
     freq_df = pd.DataFrame({
         'qubit': list(range(n_qubits)),
         'freq_scale': freq_scales
     })
-    freq_filename = f"FourierQTCN_q{n_qubits}_d{circuit_depth}_seed{seed}_freqscales.csv"
+    freq_filename = os.path.join(metrics_dir, f"FourierQTCN_q{n_qubits}_d{circuit_depth}_seed{seed}_freqscales.csv")
     freq_df.to_csv(freq_filename, index=False)
     print(f"Frequency scales saved to {freq_filename}")
 
-    return test_loss, test_auc, model
+    return test_loss, test_metric, model
 
 
 # =============================================================================
@@ -783,27 +847,17 @@ def print_comparison():
 if __name__ == "__main__":
     args = get_args()
 
-    # Print comparison
     print_comparison()
 
-    # Load data
-    print("Loading data...")
-    train_loader, val_loader, test_loader, input_dim = load_eeg_ts_revised(
-        seed=args.seed,
-        device=device,
-        batch_size=32,
-        sampling_freq=args.freq,
-        sample_size=args.n_sample
-    )
-
-    print(f"Input Dimension: {input_dim}")
-    print(f"Sampling Frequency: {args.freq} Hz")
+    # Load data via dispatcher
+    train_loader, val_loader, test_loader, input_dim, task, scaler = load_dataset(args, device)
+    print(f"Dataset: {args.dataset}, Task: {task}, Input dim: {input_dim}")
 
     # Adjust kernel_size and dilation based on sampling frequency
     if args.kernel_size is None:
-        if args.freq == 80:
+        if getattr(args, 'freq', 80) == 80:
             kernel_size, dilation = 12, 3
-        elif args.freq == 4:
+        elif getattr(args, 'freq', 80) == 4:
             kernel_size, dilation = 7, 2
         else:
             kernel_size, dilation = 10, 2
@@ -811,8 +865,7 @@ if __name__ == "__main__":
         kernel_size = args.kernel_size
         dilation = args.dilation
 
-    # Run training
-    test_loss, test_auc, model = run_training(
+    test_loss, test_metric, model = run_training(
         seed=args.seed,
         n_qubits=args.n_qubits,
         circuit_depth=args.circuit_depth,
@@ -826,10 +879,13 @@ if __name__ == "__main__":
         num_epochs=args.num_epochs,
         lr=args.lr,
         resume=args.resume,
-        args=args
+        args=args,
+        task=task,
+        freq_init=args.freq_init
     )
 
+    metric_name = 'AUC' if task == 'classification' else 'RMSE'
     print(f"\n{'='*60}")
     print("Training Complete!")
-    print(f"Final Test AUC: {test_auc:.4f}")
+    print(f"Final Test {metric_name}: {test_metric:.4f}")
     print(f"{'='*60}")

@@ -30,6 +30,7 @@ from torch.optim import Adam
 from typing import Tuple, Optional, List
 import time
 import os
+import csv
 import copy
 import random
 
@@ -43,6 +44,9 @@ except ImportError:
         from data.narma_generator import get_narma_data
     except ImportError:
         print("Warning: NARMA data generator not found.")
+
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
 
 
 def set_all_seeds(seed: int = 42) -> None:
@@ -137,13 +141,15 @@ class FrequencyMatchedVQC(nn.Module):
         n_qubits: int,
         vqc_depth: int,
         n_outputs: int = 1,
-        freq_scale_init: torch.Tensor = None
+        freq_scale_init: torch.Tensor = None,
+        ablate_freq_match: bool = False
     ):
         super().__init__()
 
         self.n_qubits = n_qubits
         self.vqc_depth = vqc_depth
         self.n_outputs = n_outputs
+        self.ablate_freq_match = ablate_freq_match
 
         # =================================================================
         # LEARNABLE FREQUENCY SCALING (Essential for periodic advantage)
@@ -187,7 +193,9 @@ class FrequencyMatchedVQC(nn.Module):
             qml.RY(inputs[i], wires=i)
 
             # RX with learnable frequency scaling (KEY for periodic advantage)
-            qml.RX(self.freq_scale[i] * inputs[i], wires=i)
+            # Ablation B: skip RX to reduce expressible frequencies (9^n → 3^n)
+            if not self.ablate_freq_match:
+                qml.RX(self.freq_scale[i] * inputs[i], wires=i)
 
         # =================================================================
         # VARIATIONAL LAYERS
@@ -255,7 +263,10 @@ class FourierQLSTMCell(nn.Module):
         vqc_depth: int,
         n_frequencies: int = None,
         window_size: int = 8,
-        freq_scale_init: torch.Tensor = None
+        freq_scale_init: torch.Tensor = None,
+        ablate_fft: bool = False,
+        ablate_freq_match: bool = False,
+        ablate_rescaled: bool = False
     ):
         """
         Args:
@@ -266,6 +277,9 @@ class FourierQLSTMCell(nn.Module):
             n_frequencies: Number of FFT frequencies to use
             window_size: Size of input window for FFT
             freq_scale_init: Optional FFT-seeded initialization for freq_scale
+            ablate_fft: Ablation A - bypass FFT, use raw windowed input
+            ablate_freq_match: Ablation B - remove RX gate, RY-only encoding
+            ablate_rescaled: Ablation C - use sigmoid instead of (x+1)/2
         """
         super().__init__()
 
@@ -273,6 +287,9 @@ class FourierQLSTMCell(nn.Module):
         self.hidden_size = hidden_size
         self.n_qubits = n_qubits
         self.window_size = window_size
+        self.ablate_fft = ablate_fft
+        self.ablate_freq_match = ablate_freq_match
+        self.ablate_rescaled = ablate_rescaled
 
         # Number of frequencies from FFT (rfft gives n/2 + 1 frequencies)
         self.n_frequencies = n_frequencies if n_frequencies else window_size // 2 + 1
@@ -280,8 +297,12 @@ class FourierQLSTMCell(nn.Module):
         # =================================================================
         # INPUT PROJECTION (FFT features → n_qubits)
         # =================================================================
-        # FFT gives magnitude + phase, so 2 * n_frequencies features
-        self.fft_feature_dim = self.n_frequencies * 2 * input_size
+        # Ablation A: use raw flattened window instead of FFT features
+        if self.ablate_fft:
+            self.fft_feature_dim = window_size * input_size
+        else:
+            # FFT gives magnitude + phase, so 2 * n_frequencies features
+            self.fft_feature_dim = self.n_frequencies * 2 * input_size
         self.input_projection = nn.Linear(self.fft_feature_dim, n_qubits)
 
         # =================================================================
@@ -294,10 +315,10 @@ class FourierQLSTMCell(nn.Module):
         # VQC GATES (4 circuits, one for each LSTM gate)
         # =================================================================
         # These replace classical Linear + sigmoid/tanh
-        self.input_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init)
-        self.forget_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init)
-        self.cell_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init)
-        self.output_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init)
+        self.input_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init, ablate_freq_match=ablate_freq_match)
+        self.forget_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init, ablate_freq_match=ablate_freq_match)
+        self.cell_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init, ablate_freq_match=ablate_freq_match)
+        self.output_gate = FrequencyMatchedVQC(n_qubits, vqc_depth, hidden_size, freq_scale_init=freq_scale_init, ablate_freq_match=ablate_freq_match)
 
         # =================================================================
         # OUTPUT PROJECTION
@@ -365,6 +386,8 @@ class FourierQLSTMCell(nn.Module):
         sigmoid(x) destroys periodicity
         (x + 1) / 2 preserves periodicity
         """
+        if self.ablate_rescaled:
+            return torch.sigmoid(x)
         return (x + 1) / 2
 
     def forward(
@@ -394,8 +417,12 @@ class FourierQLSTMCell(nn.Module):
 
         # =================================================================
         # STEP 1: FFT Preprocessing (Lossless frequency extraction)
+        # Ablation A: bypass FFT, use raw flattened window
         # =================================================================
-        fft_features = self._extract_fft_features(x)
+        if self.ablate_fft:
+            fft_features = x.reshape(batch_size, -1) if x.dim() == 3 else x
+        else:
+            fft_features = self._extract_fft_features(x)
 
         # =================================================================
         # STEP 2: Project to qubit dimension
@@ -479,7 +506,10 @@ class FourierQLSTM(nn.Module):
         output_size: int = 1,
         window_size: int = 8,
         n_frequencies: int = None,
-        freq_scale_init: torch.Tensor = None
+        freq_scale_init: torch.Tensor = None,
+        ablate_fft: bool = False,
+        ablate_freq_match: bool = False,
+        ablate_rescaled: bool = False
     ):
         super().__init__()
 
@@ -494,7 +524,10 @@ class FourierQLSTM(nn.Module):
             vqc_depth=vqc_depth,
             n_frequencies=n_frequencies,
             window_size=window_size,
-            freq_scale_init=freq_scale_init
+            freq_scale_init=freq_scale_init,
+            ablate_fft=ablate_fft,
+            ablate_freq_match=ablate_freq_match,
+            ablate_rescaled=ablate_rescaled
         )
 
         # Final output layer
@@ -657,8 +690,16 @@ def get_args():
                         choices=["narma", "multisine", "mackey_glass", "adding"],
                         help="Dataset to use (default: narma)")
     parser.add_argument("--freq-init", type=str, default="fft",
-                        choices=["fft", "linspace"],
-                        help="freq_scale initialization: 'fft' (data-informed) or 'linspace' (generic)")
+                        choices=["fft", "linspace", "random"],
+                        help="freq_scale initialization: 'fft' (data-informed), 'linspace' (generic), or 'random' (ablation D)")
+    parser.add_argument("--ablate-fft", action="store_true",
+                        help="Ablation A: bypass FFT, use raw windowed input")
+    parser.add_argument("--ablate-freq-match", action="store_true",
+                        help="Ablation B: remove RX gate, RY-only encoding")
+    parser.add_argument("--ablate-rescaled", action="store_true",
+                        help="Ablation C: use sigmoid instead of (x+1)/2")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Directory for output metrics CSV")
     return parser.parse_args()
 
 
@@ -668,6 +709,22 @@ def main():
     print_comparison()
 
     args = get_args()
+
+    # Force linspace init when ablating FFT (can't do FFT init without FFT)
+    if args.ablate_fft and args.freq_init == 'fft':
+        print("Note: --ablate-fft forces --freq-init=linspace (can't do FFT init without FFT)")
+        args.freq_init = 'linspace'
+
+    # Determine variant name from ablation flags
+    variant = "full"
+    if args.ablate_fft:
+        variant = "no_fft"
+    elif args.ablate_freq_match:
+        variant = "no_freq_match"
+    elif args.ablate_rescaled:
+        variant = "no_rescaled"
+    elif args.freq_init == "random":
+        variant = "no_fft_init"
 
     # Configuration
     set_all_seeds(args.seed)
@@ -694,6 +751,11 @@ def main():
     print(f"VQC depth: {vqc_depth}")
     print(f"Window size: {window_size}")
     print(f"Dataset: {args.dataset}")
+    print(f"Variant: {variant}")
+    print(f"Freq init: {args.freq_init}")
+    print(f"Ablate FFT: {args.ablate_fft}")
+    print(f"Ablate Freq-Match: {args.ablate_freq_match}")
+    print(f"Ablate Rescaled: {args.ablate_rescaled}")
     print(f"{'='*60}\n")
 
     # Generate data
@@ -727,10 +789,13 @@ def main():
     print(f"Test samples: {len(x_test)}")
     print(f"Input shape: {x_train.shape}")
 
-    # Compute FFT-seeded freq_scale initialization if requested
+    # Compute freq_scale initialization
     freq_scale_init = None
     if args.freq_init == 'fft':
         freq_scale_init = analyze_training_frequencies(x_train, n_qubits)
+    elif args.freq_init == 'random':
+        freq_scale_init = torch.rand(n_qubits) * 2.5 + 0.5  # uniform [0.5, 3.0]
+        print(f"Random freq_scale init: {freq_scale_init.tolist()}")
 
     # Create model
     model = FourierQLSTM(
@@ -740,7 +805,10 @@ def main():
         vqc_depth=vqc_depth,
         output_size=output_size,
         window_size=window_size,
-        freq_scale_init=freq_scale_init
+        freq_scale_init=freq_scale_init,
+        ablate_fft=args.ablate_fft,
+        ablate_freq_match=args.ablate_freq_match,
+        ablate_rescaled=args.ablate_rescaled
     ).double()
 
     # Optimizer
@@ -785,6 +853,18 @@ def main():
     ]:
         scales = gate.get_freq_scales()
         print(f"  {gate_name}: {scales}")
+
+    # Save metrics CSV
+    output_dir = args.output_dir or os.path.join(RESULTS_DIR, 'phase1_ablation')
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir,
+        f"FourierQLSTM_{args.dataset}_{variant}_seed{args.seed}_metrics.csv")
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['epoch', 'train_loss', 'test_loss'])
+        for i in range(len(train_losses)):
+            writer.writerow([i + 1, train_losses[i], test_losses[i]])
+    print(f"\nMetrics saved to {csv_path}")
 
     return model, train_losses, test_losses
 

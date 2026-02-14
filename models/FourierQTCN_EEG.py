@@ -68,8 +68,16 @@ def get_args():
     parser.add_argument("--kernel-size", type=int, default=12, help="Temporal kernel size")
     parser.add_argument("--dilation", type=int, default=3, help="Dilation factor")
     parser.add_argument("--freq-init", type=str, default="fft",
-                        choices=["fft", "linspace"],
-                        help="freq_scale initialization: 'fft' (data-informed) or 'linspace' (generic)")
+                        choices=["fft", "linspace", "random"],
+                        help="freq_scale initialization: 'fft' (data-informed), 'linspace' (generic), or 'random' (ablation D)")
+    parser.add_argument("--ablate-fft", action="store_true",
+                        help="Ablation A: bypass FFT, use raw windowed input")
+    parser.add_argument("--ablate-freq-match", action="store_true",
+                        help="Ablation B: remove RX gate, RY-only encoding")
+    parser.add_argument("--ablate-rescaled", action="store_true",
+                        help="Ablation C: apply sigmoid to quantum output (destroys periodicity)")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Directory for output metrics CSV")
     add_dataset_args(parser)
     return parser.parse_args()
 
@@ -200,7 +208,10 @@ class FourierQTCN(nn.Module):
         dilation: int = 1,
         n_frequencies: int = None,
         use_magnitude_phase: bool = True,
-        freq_scale_init: torch.Tensor = None
+        freq_scale_init: torch.Tensor = None,
+        ablate_fft: bool = False,
+        ablate_freq_match: bool = False,
+        ablate_rescaled: bool = False
     ):
         """
         Args:
@@ -212,6 +223,9 @@ class FourierQTCN(nn.Module):
             n_frequencies: Number of FFT frequencies to use (default: n_qubits)
             use_magnitude_phase: If True, use magnitude and phase; else use real/imag
             freq_scale_init: Optional FFT-seeded initialization for freq_scale
+            ablate_fft: Ablation A - bypass FFT, use raw windowed input
+            ablate_freq_match: Ablation B - remove RX gate, RY-only encoding
+            ablate_rescaled: Ablation C - apply sigmoid to quantum output
         """
         super().__init__()
 
@@ -222,6 +236,9 @@ class FourierQTCN(nn.Module):
         self.kernel_size = kernel_size
         self.dilation = dilation
         self.use_magnitude_phase = use_magnitude_phase
+        self.ablate_fft = ablate_fft
+        self.ablate_freq_match = ablate_freq_match
+        self.ablate_rescaled = ablate_rescaled
 
         # Number of FFT frequencies to extract
         # Default to n_qubits for direct mapping, but clamp to max FFT bins
@@ -231,10 +248,14 @@ class FourierQTCN(nn.Module):
         # =================================================================
         # COMPONENT 1: FFT Feature Dimension Calculation
         # =================================================================
-        # FFT gives complex values, we extract 2 features per frequency:
-        # Option A: real and imaginary parts
-        # Option B: magnitude and phase (often better for signals)
-        self.fft_feature_dim = self.input_channels * self.n_frequencies * 2
+        # Ablation A: use raw flattened window instead of FFT features
+        if self.ablate_fft:
+            self.fft_feature_dim = self.input_channels * self.kernel_size
+        else:
+            # FFT gives complex values, we extract 2 features per frequency:
+            # Option A: real and imaginary parts
+            # Option B: magnitude and phase (often better for signals)
+            self.fft_feature_dim = self.input_channels * self.n_frequencies * 2
 
         # =================================================================
         # COMPONENT 2: Simple Linear Projection
@@ -388,9 +409,9 @@ class FourierQTCN(nn.Module):
             qml.RY(features[..., i], wires=wire)
 
             # FREQUENCY-MATCHED encoding (RX rotation with learnable scaling)
-            # This is analogous to Snake's learnable 'a' parameter
-            # It maps the input to VQC's natural frequency spectrum
-            qml.RX(self.freq_scale[i] * features[..., i], wires=wire)
+            # Ablation B: skip RX to reduce expressible frequencies (9^n → 3^n)
+            if not self.ablate_freq_match:
+                qml.RX(self.freq_scale[i] * features[..., i], wires=wire)
 
         # =================================================================
         # QUANTUM CONVOLUTIONAL AND POOLING LAYERS
@@ -483,8 +504,12 @@ class FourierQTCN(nn.Module):
 
             # =================================================================
             # STEP 1: FFT-based frequency extraction (LOSSLESS)
+            # Ablation A: bypass FFT, use raw flattened window
             # =================================================================
-            fft_features = self._extract_fft_features(window)
+            if self.ablate_fft:
+                fft_features = window.reshape(batch_size, -1)
+            else:
+                fft_features = self._extract_fft_features(window)
 
             # =================================================================
             # STEP 2: Simple linear projection
@@ -499,6 +524,13 @@ class FourierQTCN(nn.Module):
             # =================================================================
             # Cast to float64 for PennyLane backprop compatibility, then back
             window_output = self.quantum_circuit(projected.double()).float()
+
+            # Ablation C: apply sigmoid to quantum output (destroys periodicity)
+            if self.ablate_rescaled:
+                window_output = torch.sigmoid(window_output)
+            else:
+                window_output = (window_output + 1) / 2  # preserves periodicity
+
             outputs.append(window_output)
 
         # =================================================================
@@ -640,20 +672,43 @@ def run_training(
     resume: bool = False,
     args=None,
     task: str = 'classification',
-    freq_init: str = 'fft'
+    freq_init: str = 'fft',
+    ablate_fft: bool = False,
+    ablate_freq_match: bool = False,
+    ablate_rescaled: bool = False,
+    output_dir: str = None
 ):
     """Run full training pipeline for Fourier-Based QTCN."""
+
+    # Determine variant name from ablation flags
+    variant = "full"
+    if ablate_fft:
+        variant = "no_fft"
+    elif ablate_freq_match:
+        variant = "no_freq_match"
+    elif ablate_rescaled:
+        variant = "no_rescaled"
+    elif freq_init == "random":
+        variant = "no_fft_init"
+
     print(f"\n{'='*60}")
     print("Starting Fourier-Based QTCN Training")
     print(f"{'='*60}")
 
     set_all_seeds(seed)
     print(f"Random Seed: {seed}")
+    print(f"Variant: {variant}")
+    print(f"Ablate FFT: {ablate_fft}")
+    print(f"Ablate Freq-Match: {ablate_freq_match}")
+    print(f"Ablate Rescaled: {ablate_rescaled}")
 
-    # Compute FFT-seeded freq_scale initialization if requested
+    # Compute freq_scale initialization
     freq_scale_init = None
     if freq_init == 'fft':
         freq_scale_init = analyze_training_frequencies(train_loader, n_qubits)
+    elif freq_init == 'random':
+        freq_scale_init = torch.rand(n_qubits) * 2.5 + 0.5  # uniform [0.5, 3.0]
+        print(f"Random freq_scale init: {freq_scale_init.tolist()}")
 
     # Create model
     model = FourierQTCN(
@@ -663,7 +718,10 @@ def run_training(
         kernel_size=kernel_size,
         dilation=dilation,
         n_frequencies=n_frequencies,
-        freq_scale_init=freq_scale_init
+        freq_scale_init=freq_scale_init,
+        ablate_fft=ablate_fft,
+        ablate_freq_match=ablate_freq_match,
+        ablate_rescaled=ablate_rescaled
     ).to(device)
 
     # Task-specific criterion and tracking
@@ -780,11 +838,16 @@ def run_training(
             f'test_{metric_name}': test_metric
         })
 
-    metrics_dir = os.path.join(RESULTS_DIR, 'metrics')
+    # Use output_dir for ablation experiments, else default metrics dir
+    if output_dir:
+        metrics_dir = output_dir
+    else:
+        metrics_dir = os.path.join(RESULTS_DIR, 'metrics')
     os.makedirs(metrics_dir, exist_ok=True)
 
+    dataset_name = getattr(args, 'dataset', 'eeg') if args else 'eeg'
     metrics_df = pd.DataFrame(metrics)
-    csv_filename = os.path.join(metrics_dir, f"FourierQTCN_q{n_qubits}_d{circuit_depth}_seed{seed}_metrics.csv")
+    csv_filename = os.path.join(metrics_dir, f"FourierQTCN_{dataset_name}_{variant}_seed{seed}_metrics.csv")
     metrics_df.to_csv(csv_filename, index=False)
     print(f"Metrics saved to {csv_filename}")
 
@@ -792,7 +855,7 @@ def run_training(
         'qubit': list(range(n_qubits)),
         'freq_scale': freq_scales
     })
-    freq_filename = os.path.join(metrics_dir, f"FourierQTCN_q{n_qubits}_d{circuit_depth}_seed{seed}_freqscales.csv")
+    freq_filename = os.path.join(metrics_dir, f"FourierQTCN_{dataset_name}_{variant}_seed{seed}_freqscales.csv")
     freq_df.to_csv(freq_filename, index=False)
     print(f"Frequency scales saved to {freq_filename}")
 
@@ -865,6 +928,12 @@ if __name__ == "__main__":
         kernel_size = args.kernel_size
         dilation = args.dilation
 
+    # Force linspace init when ablating FFT
+    freq_init = args.freq_init
+    if args.ablate_fft and freq_init == 'fft':
+        print("Note: --ablate-fft forces --freq-init=linspace (can't do FFT init without FFT)")
+        freq_init = 'linspace'
+
     test_loss, test_metric, model = run_training(
         seed=args.seed,
         n_qubits=args.n_qubits,
@@ -881,7 +950,11 @@ if __name__ == "__main__":
         resume=args.resume,
         args=args,
         task=task,
-        freq_init=args.freq_init
+        freq_init=freq_init,
+        ablate_fft=args.ablate_fft,
+        ablate_freq_match=args.ablate_freq_match,
+        ablate_rescaled=args.ablate_rescaled,
+        output_dir=args.output_dir
     )
 
     metric_name = 'AUC' if task == 'classification' else 'RMSE'
